@@ -1,0 +1,298 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{% block title %}Shortlist Builder{% endblock %} — Content Shortlist Builder</title>
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><path d='M4 1h5l3 3v11H4z' fill='%231d70b8'/><path d='M9 1v3h3z' fill='%23003078'/><g fill='none' stroke='%23fff' stroke-width='1' stroke-linecap='round'><path d='M6 7h5'/><path d='M6 9h5'/><path d='M6 11h4'/></g></svg>">
+  <link rel="stylesheet" href="{{ url_for('static', path='govuk.css') }}">
+</head>
+<body>
+  <script>
+    // Apply the saved UI display level (Profile page) as early as possible, before the
+    // page paints, so higher-level elements don't flash in. If no level has been chosen yet
+    // (e.g. a user's first login), default to Simple and remember it, so people start on the
+    // uncluttered view and can opt into more detail on the Profile page.
+    (function () { try { var l = localStorage.getItem("ui_level"); if (!l) { l = "simple"; } else if (l !== "simple" && l !== "advanced") { l = "advanced"; } localStorage.setItem("ui_level", l); document.documentElement.setAttribute("data-ui-level", l); } catch (e) {} })();
+  </script>
+  <script>
+    // CSRF: echo the sb_csrf cookie in an X-CSRF-Token header on every same-origin
+    // state-changing fetch, so page scripts need no per-call changes. Runs before them.
+    (function () {
+      function token() { var m = document.cookie.match(/(?:^|; )sb_csrf=([^;]+)/); return m ? decodeURIComponent(m[1]) : ""; }
+      function sameOrigin(u) { try { return !u || u.charAt(0) === "/" || new URL(u, location.href).origin === location.origin; } catch (e) { return false; } }
+      var _fetch = window.fetch;
+      window.fetch = function (input, init) {
+        init = init || {};
+        var method = (init.method || (typeof input === "object" && input && input.method) || "GET").toUpperCase();
+        var url = (typeof input === "string") ? input : (input && input.url);
+        if (method !== "GET" && method !== "HEAD" && sameOrigin(url)) {
+          var h = new Headers(init.headers || {});
+          if (!h.has("X-CSRF-Token")) h.set("X-CSRF-Token", token());
+          init.headers = h;
+        }
+        return _fetch(input, init);
+      };
+    })();
+  </script>
+  <div class="masthead"><div class="wrap">
+    <img class="brand-logo" src="{{ url_for('static', path='notgovuk.svg') }}"
+         alt="NOT.GOV.UK — Defra supplier, operated with GOV.UK API-supplied data">
+    <span class="brand">Content Shortlist Builder</span></div></div>
+
+  <div class="navbar"><div class="wrap inner">
+    <span class="service">Content Relevance Filters</span>
+    <a href="{{ url_for('list_categories_page') }}" class="{{ 'active' if active_nav not in ['settings','users','sustainability','help'] }}">Shortlists</a>
+    <a href="{{ url_for('sustainability_page') }}" class="{{ 'active' if active_nav == 'sustainability' }}">Sustainability</a>
+    <a href="{{ url_for('help_index') }}" class="{{ 'active' if active_nav == 'help' }}">Help</a>
+    {% if is_admin %}
+    <a href="{{ url_for('settings_page') }}" class="{{ 'active' if active_nav == 'settings' }}">Settings</a>
+    {% endif %}
+    {% if user %}
+    <form method="post" action="{{ url_for('do_logout') }}" style="margin-left:auto;display:flex;align-items:center;gap:12px;">
+      <input type="hidden" name="csrf" value="{{ csrf_token }}">
+      <a href="{{ url_for('profile_page') }}" class="service {{ 'active' if active_nav == 'profile' }}"
+        title="{{ user.email }} — your profile">{{ user.first_name }} {{ user.last_name }}</a>
+      <button type="submit" style="background:none;border:0;padding:14px 2px;font:inherit;color:var(--grey-text);cursor:pointer;">Sign out</button>
+    </form>
+    {% endif %}
+  </div></div>
+
+  <div class="wrap body">
+    <div class="phase">
+      <span class="meta">{{ corpus_meta }}</span>
+      {% if budget_bar %}
+      {% set b = budget_bar %}
+      {% set pct = b.pct if b.pct is not none else 0 %}
+      {% set fill = pct if pct < 100 else 100 %}
+      {% set color = '#00703c' if pct < 50 else ('#f47738' if pct < 80 else '#d4351c') %}
+      <span class="budget-inline" title="Daily AI spend">
+        <span class="meta">Daily AI spend</span>
+        <strong style="color:{{ color if b.budget and b.budget > 0 }};">${{ '%.2f'|format(b.spent) }}</strong>{% if b.budget and b.budget > 0 %}<span class="meta">of ${{ '%.2f'|format(b.budget) }} · {{ '%.0f'|format(pct) }}%</span>
+        <span class="budget-track" title="{{ '%.0f'|format(pct) }}% of today's ${{ '%.2f'|format(b.budget) }} budget"><span class="budget-fill" style="width:{{ fill }}%;background:{{ color }};"></span></span>{% else %}<span class="meta">· no budget set</span>{% endif %}
+      </span>
+      {% endif %}
+      {% if deepseek_balance and deepseek_balance.total %}
+      <span class="budget-inline" title="DeepSeek account balance (live)">
+        <span class="meta">DeepSeek balance</span>
+        <strong>{% if deepseek_balance.currency == 'USD' %}${{ deepseek_balance.total }}{% else %}{{ deepseek_balance.currency }} {{ deepseek_balance.total }}{% endif %}</strong>
+      </span>
+      {% endif %}
+    </div>
+    {% block content %}{% endblock %}
+  </div>
+
+  <footer class="site-strap">Defra Supplier Operated with GOV.UK API supplied data</footer>
+
+  <!-- Per-page tracking ID (guc-####). Every page sets this — see PAGE_INDEX.md. -->
+  <div class="page-id">{% block page_id %}{% endblock %}</div>
+
+  <!-- Per-page feedback widget (records the page id + title, rating and comment). -->
+  <style>
+    .fb-fab{position:fixed;right:18px;bottom:18px;z-index:40;display:inline-flex;align-items:center;gap:8px;
+      background:var(--blue,#1d70b8);color:#fff;border:0;border-radius:24px;padding:10px 18px;font:inherit;
+      font-weight:700;cursor:pointer;box-shadow:0 2px 10px rgba(0,0,0,.25);}
+    .fb-fab:hover{background:var(--dark-blue,#003078);}
+    .fb-fab svg{width:16px;height:16px;}
+    .fb-overlay{position:fixed;inset:0;z-index:50;background:rgba(11,12,12,.45);display:flex;
+      align-items:flex-end;justify-content:center;padding:16px;}
+    @media (min-width:600px){.fb-overlay{align-items:center;}}
+    .fb-card{background:var(--white,#fff);color:var(--black,#0b0c0c);border-radius:12px;padding:20px 22px;
+      width:100%;max-width:460px;box-shadow:0 12px 40px rgba(0,0,0,.3);}
+    .fb-top{display:flex;align-items:center;justify-content:space-between;margin-bottom:2px;}
+    .fb-top strong{font-size:18px;}
+    .fb-close{background:none;border:0;font-size:26px;line-height:1;cursor:pointer;color:var(--grey-text,#505a5f);}
+    .fb-pid{margin:0 0 14px;font-size:13px;}
+    .fb-q{margin:0 0 12px;}
+    .fb-qlabel{font-weight:600;font-size:15px;margin-bottom:4px;}
+    .fb-stars{display:inline-flex;gap:2px;}
+    .fb-star{background:none;border:0;padding:0 2px;font-size:26px;line-height:1;cursor:pointer;color:#c9ccce;}
+    .fb-star.on{color:#ffb400;}
+    .fb-label{display:block;font-weight:600;margin:6px 0 4px;}
+    .fb-text{width:100%;box-sizing:border-box;border:2px solid var(--black,#0b0c0c);border-radius:8px;
+      padding:8px 10px;font:inherit;resize:vertical;}
+    .fb-actions{display:flex;align-items:center;gap:12px;margin-top:14px;}
+    @media print{.fb-fab{display:none;}}
+  </style>
+  <button type="button" id="fb-open" class="fb-fab" aria-haspopup="dialog">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>
+    Feedback
+  </button>
+  <div id="fb-modal" class="fb-overlay" hidden>
+    <div class="fb-card" role="dialog" aria-modal="true" aria-labelledby="fb-h">
+      <div class="fb-top">
+        <strong id="fb-h">Feedback on this page</strong>
+        <button type="button" id="fb-close" class="fb-close" aria-label="Close">&times;</button>
+      </div>
+      <p class="secondary fb-pid" id="fb-pid"></p>
+      <div id="fb-questions"></div>
+      <label class="fb-label" for="fb-text">Any comments? (optional)</label>
+      <textarea id="fb-text" class="fb-text" rows="4" placeholder="What worked, what didn't, what's missing…"></textarea>
+      <div class="fb-actions">
+        <button type="button" id="fb-send" class="btn">Send feedback</button>
+        <span id="fb-status" class="secondary"></span>
+      </div>
+    </div>
+  </div>
+  <script>
+    (function () {
+      const QUESTIONS = [
+        ["q_functionality", "Does this page do what you need?"],
+        ["q_ease", "Is it easy to use?"],
+        ["q_quality", "Quality of the results / output?"]
+      ];
+      const modal = document.getElementById("fb-modal");
+      const qWrap = document.getElementById("fb-questions");
+      const textEl = document.getElementById("fb-text");
+      const statusEl = document.getElementById("fb-status");
+      const sendBtn = document.getElementById("fb-send");
+      const stars = {};
+
+      function paint(group, n) { [...group.children].forEach(s => s.classList.toggle("on", Number(s.dataset.v) <= n)); }
+      QUESTIONS.forEach(([field, label]) => {
+        stars[field] = 0;
+        const row = document.createElement("div"); row.className = "fb-q";
+        const l = document.createElement("div"); l.className = "fb-qlabel"; l.textContent = label;
+        const group = document.createElement("div"); group.className = "fb-stars";
+        group.setAttribute("role", "radiogroup"); group.setAttribute("aria-label", label);
+        for (let i = 1; i <= 5; i++) {
+          const s = document.createElement("button");
+          s.type = "button"; s.className = "fb-star"; s.dataset.v = i; s.textContent = "★";
+          s.setAttribute("aria-label", i + " of 5");
+          s.addEventListener("click", () => { stars[field] = i; paint(group, i); });
+          s.addEventListener("mouseenter", () => paint(group, i));
+          group.appendChild(s);
+        }
+        group.addEventListener("mouseleave", () => paint(group, stars[field]));
+        row.appendChild(l); row.appendChild(group); qWrap.appendChild(row);
+      });
+
+      function pageId() { const el = document.querySelector(".page-id"); return el ? el.textContent.trim() : ""; }
+      function pageTitle() {
+        const h = document.querySelector("h1");
+        const ht = h ? h.textContent.trim() : "";
+        // Prefer a non-empty <h1>; otherwise the page's own title (some headings fill in via JS
+        // after load, so the h1 can be empty at submit time). Strip the app-name suffix.
+        let t = (ht || (document.title || "").replace(/\s*[—-]\s*Content Shortlist Builder\s*$/, "")).trim();
+        // On a tabbed page, append the active tab(s) so the context is clear (e.g. the outer tab
+        // plus the sub-tab). Active tabs are marked with class "current" in the tab bars.
+        const seen = new Set(), tabs = [];
+        document.querySelectorAll(".tabs .current, .stab.current, .subtab.current, .gtabs a.current").forEach(el => {
+          if (el.offsetParent === null && !el.getClientRects().length) return;   // skip hidden
+          const label = (el.textContent || "").trim().replace(/\s+/g, " ");
+          if (label && label !== t && !seen.has(label)) { seen.add(label); tabs.push(label); }
+        });
+        if (tabs.length) t = (t ? t + " — " : "") + tabs.join(" · ");
+        return t.slice(0, 200);
+      }
+      function show(on) {
+        modal.hidden = !on;
+        if (on) { document.getElementById("fb-pid").textContent = "Page " + (pageId() || "—"); statusEl.textContent = ""; }
+      }
+      document.getElementById("fb-open").addEventListener("click", () => show(true));
+      document.getElementById("fb-close").addEventListener("click", () => show(false));
+      modal.addEventListener("click", e => { if (e.target === modal) show(false); });
+      document.addEventListener("keydown", e => { if (e.key === "Escape" && !modal.hidden) show(false); });
+
+      sendBtn.addEventListener("click", async () => {
+        const hasStar = Object.values(stars).some(v => v > 0);
+        if (!hasStar && !textEl.value.trim()) { statusEl.textContent = "Add a rating or a comment first."; return; }
+        sendBtn.disabled = true; statusEl.innerHTML = '<span class="spinner"></span> Sending…';
+        try {
+          const r = await fetch("/feedback", {
+            method: "POST", headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              page_id: pageId(), page_title: pageTitle(), feedback_text: textEl.value,
+              q_functionality: stars.q_functionality || null, q_ease: stars.q_ease || null,
+              q_quality: stars.q_quality || null
+            })
+          });
+          const j = await r.json();
+          if (j.ok) {
+            statusEl.textContent = "Thanks — your feedback was sent.";
+            textEl.value = "";
+            Object.keys(stars).forEach(k => stars[k] = 0);
+            [...qWrap.querySelectorAll(".fb-stars")].forEach(g => paint(g, 0));
+            setTimeout(() => show(false), 1000);
+          } else { statusEl.textContent = "Error: " + (j.error || "could not send"); }
+        } catch (e) { statusEl.textContent = "Could not send feedback."; }
+        finally { sendBtn.disabled = false; }
+      });
+    })();
+  </script>
+
+  <script>
+    // Fill an advanced-only "Show SQL" panel (from _sql.html's sql_panel macro) once a
+    // JSON-fed list has loaded and returned its .sql. Reveals the disclosure only when
+    // there is SQL to show; advanced-gating still hides it for non-advanced users.
+    window.setSqlPanel = function (preId, sql) {
+      var pre = document.getElementById(preId);
+      if (!pre) return;
+      pre.textContent = sql || "-- (no SQL)";
+      var det = pre.closest("details");
+      if (det) det.hidden = false;
+    };
+  </script>
+
+  <script>
+    // Policy: every textarea grows to fit its content. Native CSS field-sizing:content
+    // (in govuk.css) handles this where supported; this is the fallback for browsers
+    // that lack it — it grows to the CSS max-height, then lets the box scroll.
+    (function () {
+      if ("fieldSizing" in document.createElement("textarea").style) return;  // native
+      function grow(ta) {
+        if (ta.offsetParent === null) return;   // hidden: measuring gives a wrong height
+        var max = Math.round(window.innerHeight * 0.6);
+        ta.style.height = "auto";
+        var h = Math.min(ta.scrollHeight + 2, max);
+        ta.style.height = h + "px";
+        ta.style.overflowY = (ta.scrollHeight + 2) > max ? "auto" : "hidden";
+      }
+      function wire() {
+        [].forEach.call(document.querySelectorAll("textarea"), function (ta) {
+          if (ta.__autogrow) return;
+          ta.__autogrow = true;
+          ta.addEventListener("input", function () { grow(ta); });
+          grow(ta);
+        });
+      }
+      if (document.readyState !== "loading") wire();
+      else document.addEventListener("DOMContentLoaded", wire);
+      window.addEventListener("load", wire);   // re-measure once fonts/layout settle
+    })();
+  </script>
+  <script>
+    // Policy: links to gov.uk pages (corpus / shortlist content) always open in a NEW TAB,
+    // so the user never loses their place in the tool. App-internal links are same-origin
+    // (not gov.uk) and are left alone. Covers both server-rendered anchors and the many
+    // links inserted later via fetch+innerHTML (results tables, coverage, breakdowns) by
+    // watching the DOM. See CLAUDE.md > Web pages.
+    (function () {
+      function isGovUk(a) {
+        try { return /(^|\.)gov\.uk$/i.test(new URL(a.href, location.href).hostname); }
+        catch (e) { return false; }
+      }
+      function mark(a) {
+        if (a.__extTab || !a.getAttribute("href") || !isGovUk(a)) return;
+        a.__extTab = true;
+        a.target = "_blank";
+        a.rel = a.rel ? a.rel : "noopener noreferrer";   // security: no window.opener access
+      }
+      function scan(root) {
+        if (root.nodeType !== 1) return;
+        if (root.matches && root.matches("a[href]")) mark(root);
+        if (root.querySelectorAll) [].forEach.call(root.querySelectorAll("a[href]"), mark);
+      }
+      function start() {
+        scan(document.body);
+        new MutationObserver(function (muts) {
+          for (var i = 0; i < muts.length; i++)
+            [].forEach.call(muts[i].addedNodes, scan);
+        }).observe(document.body, { childList: true, subtree: true });
+      }
+      if (document.readyState !== "loading") start();
+      else document.addEventListener("DOMContentLoaded", start);
+    })();
+  </script>
+</body>
+</html>

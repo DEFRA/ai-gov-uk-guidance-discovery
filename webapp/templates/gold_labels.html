@@ -1,0 +1,587 @@
+{% extends "base.html" %}
+{% block page_id %}{% if wizard %}guc-0031{% else %}guc-0029{% endif %}{% endblock %}
+{% block title %}{{ category.display_name }} — gold labels{% if wizard %} (wizard){% endif %}{% endblock %}
+{% block content %}
+
+  {% macro chip(k) %}
+    {%- if k == 1 -%}<span class="kd keep">KEEP</span>
+    {%- elif k == 0 -%}<span class="kd drop">DROP</span>
+    {%- else -%}<span class="kd none">—</span>{%- endif -%}
+  {% endmacro %}
+
+  <a class="back" href="{{ url_for('performance_page', cid=category.id) }}">‹ Run performance</a>
+  <h1 style="margin:16px 0 6px;">Gold labels{% if wizard %} <span class="muted-sm" style="font-weight:400;">· one page at a time</span>{% endif %}</h1>
+  <p class="hint" style="margin-top:0;">Rate what the pipeline did with each page in <strong>one run</strong>:
+    <em>correct</em> / <em>wrong</em> / <em>borderline</em>, with a one-line reason. Each verdict is stored as a
+    gold label (correct keep → <b>in</b>, correct drop → <b>out</b>, wrong keep → <b>out</b>, wrong drop → <b>in</b>)
+    that the benchmark scores every model and run against. You don't need every page: set a <strong>target per
+    stage</strong> below and the page picks that many at random (a fixed, seeded pick, so it is the same set every
+    time and raising a target only adds pages). The sampling fraction is stored with each label so the benchmark
+    can weight it. Labels are per page, not per run, so they carry over to every run.</p>
+
+  <div class="tabs gtabs" role="tablist">
+    <a href="#setup" data-tab="setup" role="tab">Setup gold run</a>
+    <a href="#evaluate" data-tab="evaluate" role="tab">Evaluate results</a>
+  </div>
+  <div class="tabpanel gpanel" data-panel="setup">
+  <div class="card gl-who">
+    <div class="gw-row">
+      <strong>Labelling as</strong>
+      {% if my_labeller %}<span class="pill in">{{ my_labeller }}</span>
+      {% else %}<input type="text" id="who" placeholder="your name or email" maxlength="80" aria-label="Your name">{% endif %}
+      <label class="gl-chk" title="Hide the pipeline's verdicts and reasons while you label, and give the label directly. Other people's votes stay hidden until you have voted."><input type="checkbox" id="blind"> label blind (hide the model's verdicts)</label>
+      <span class="muted-sm">{% if labellers %}labellers so far: {{ labellers|join(', ') }}{% else %}no votes yet{% endif %}</span>
+      <span style="margin-left:auto;display:inline-flex;gap:8px;">
+        {% if wizard %}<a class="btn secondary-btn" style="padding:5px 12px;font-size:13px;" href="{{ url_for('gold_page', cid=category.id) }}{% if run %}?run={{ run.run_id }}{% endif %}">List view ›</a>
+        {% else %}<a class="btn secondary-btn" style="padding:5px 12px;font-size:13px;" href="{{ url_for('gold_wizard_page', cid=category.id) }}{% if run %}?run={{ run.run_id }}{% endif %}">Wizard view ›</a>{% endif %}
+        <a class="btn secondary-btn" style="padding:5px 12px;font-size:13px;" href="{{ url_for('gold_agreement_page', cid=category.id) }}">Agreement &amp; adjudication ›</a>
+      </span>
+    </div>
+    <p class="muted-sm" style="margin:6px 0 0;">Each person's vote is kept separately. The gold label is the consensus: unanimous or majority wins,
+      a two-way split becomes <em>borderline</em> until it is adjudicated. Other people's votes on a page are shown only after you have saved yours.</p>
+  </div>
+
+  <div class="card gl-top">
+    <form method="get" class="gl-runpick">
+      <label for="run-pick"><strong>Run</strong></label>
+      <select id="run-pick" name="run" onchange="this.form.submit()">
+        {% for h in heads %}
+          <option value="{{ h.run_id }}" {% if run and h.run_id == run.run_id %}selected{% endif %}>
+            {{ h.name or h.run_id }} · {{ (h.started_at or '')[:16]|replace('T',' ') }} · {{ h.provider }}/{{ h.actual_model or h.model }} · {{ h.pages or 0 }} pages, kept {{ h.kept or 0 }}
+          </option>
+        {% endfor %}
+      </select>
+    </form>
+    <div class="gl-status">
+      <span><strong id="st-labelled">{{ gold_status.labelled }}</strong> / {{ gold_status.forwarded }} forwarded pages labelled</span>
+      <span class="pill in">in <b id="st-in">{{ gold_status.counts['in'] }}</b></span>
+      <span class="pill out">out <b id="st-out">{{ gold_status.counts['out'] }}</b></span>
+      <span class="pill bl">borderline <b id="st-bl">{{ gold_status.counts['borderline'] }}</b></span>
+      {% if gold_status.drifted %}<span class="pill warn" title="Page body changed since it was labelled">{{ gold_status.drifted|length }} drifted</span>{% endif %}
+      <a class="btn secondary-btn" style="padding:5px 12px;font-size:13px;" href="{{ url_for('gold_sheet_download', cid=category.id) }}">Download sheet (CSV)</a>
+    </div>
+  </div>
+
+  {% if not run %}
+    <div class="card"><p>No inclusion run for this shortlist yet. Run the AI pipeline first, then come back to rate its outcomes.</p></div>
+  </div>{# /setup #}
+  {% else %}
+  <div class="card gl-sample">
+    <div class="gs-head">
+      <strong>Minimum gold set for this run</strong>
+      <span class="muted-sm">how many pages of each stage to label · picked at random, fixed by seed {{ 42 }}</span>
+      <label class="gl-chk" style="margin-left:auto;"><input type="checkbox" id="only-sampled" checked> show only the sampled minimum</label>
+    </div>
+    <table class="gs-table">
+      <thead><tr><th>Stage</th><th class="num">Pages</th><th class="num">Target</th><th class="num">Fraction</th><th class="num">Labelled (in sample)</th></tr></thead>
+      <tbody>
+      {% for k, lbl in stages.items() %}{% if stage_counts[k] %}
+        <tr data-stage="{{ k }}">
+          <td>{{ lbl }}</td><td class="num">{{ stage_counts[k] }}</td>
+          <td class="num"><input type="number" class="gs-target" min="0" max="{{ stage_counts[k] }}" value="{{ targets[k] }}" data-stage="{{ k }}"></td>
+          <td class="num gs-frac">{{ '%.0f'|format(100 * progress[k].frac) if progress[k] and progress[k].frac is not none else '—' }}%</td>
+          <td class="num"><span class="gs-prog">{{ progress[k].labelled_in_sample }} / {{ progress[k].target }}</span></td>
+        </tr>
+      {% endif %}{% endfor %}
+      </tbody>
+      <tfoot><tr><td>Total</td><td class="num">{{ pages|length }}</td><td class="num" id="gs-total">{{ sample_total }}</td><td></td><td></td></tr></tfoot>
+    </table>
+    <div class="gs-actions">
+      <button type="button" class="btn secondary-btn" id="gs-save">Save targets</button>
+      <span class="muted-sm" id="gs-note">Small stages are labelled in full (≤ 25 pages); bigger ones default to 40. Raising a target keeps the pages already picked.</span>
+    </div>
+  </div>
+  </div>{# /setup #}
+
+  <div class="tabpanel gpanel" data-panel="evaluate">
+  <div class="gl-filters" role="group" aria-label="Filter by the stage a page left">
+    <span class="gl-fl">Left at:</span>
+    <button type="button" class="fbtn on" data-stage="">All <span class="count">{{ pages|length }}</span></button>
+    {% for k, lbl in stages.items() %}{% if stage_counts[k] %}
+      <button type="button" class="fbtn" data-stage="{{ k }}">{{ lbl }} <span class="count" data-all="{{ stage_counts[k] }}">{{ stage_counts[k] }}</span></button>
+    {% endif %}{% endfor %}
+    <label class="gl-chk"><input type="checkbox" id="only-unlabelled"> unlabelled only</label>
+    <input type="search" id="gl-search" placeholder="filter by url or title" aria-label="filter by url or title">
+    <span class="muted-sm" id="gl-shown"></span>
+  </div>
+
+  {% if not wizard %}<div class="blind-banner" id="blind-banner" hidden>
+    <strong>Blind mode is on.</strong> The pipeline's verdicts, reasons, scores, topic and the stage filters are hidden; only its evidence quotes are shown. You label in / out / borderline directly.
+    <button type="button" class="btn secondary-btn" id="blind-off" style="padding:4px 10px;font-size:13px;margin-left:10px;">Show the model's verdicts</button>
+  </div>{% endif %}
+  <div id="gl-list">
+  {% for p in pages %}
+    <div class="card gl-card" data-url="{{ p.url }}" data-stage="{{ p.stage or '' }}" data-labelled="{{ '1' if p.label else '0' }}"
+         data-sampled="{{ '1' if p.sampled else '0' }}" data-hay="{{ (p.url ~ ' ' ~ p.title ~ ' ' ~ (p.matched_keywords|join(' ')) ~ ' ' ~ p.raw_document_type ~ ' ' ~ p.parent_document_type)|lower }}">
+      {% if wizard %}<div class="crit">{% else %}<details class="crit"><summary>What was asked for</summary>{% endif %}
+        <table class="crit-table">
+          <thead><tr><th>Inclusion criteria prompt</th><th>Exclusion criteria prompt</th></tr></thead>
+          <tbody><tr>
+            <td>{{ category.inclusion_context or '(none set)' }}</td>
+            <td>{{ category.exclusion_context or '(none set)' }}</td>
+          </tr></tbody>
+        </table>
+      {% if wizard %}</div>{% else %}</details>{% endif %}
+      <div class="gc-head">
+        <div class="gc-title">
+          <a href="{{ p.url }}" target="_blank" rel="noopener" title="{{ p.url }}">{{ p.title or p.url }}</a>
+          <div class="gc-kw">
+            {% if p.p1.primary_topic %}<span class="topic model-only" title="What the model said the page is mainly about">Topic: {{ p.p1.primary_topic }}</span>
+            <span class="gc-kw-lbl model-only" style="margin-left:10px;">Keywords matched</span>
+            {% else %}<span class="gc-kw-lbl">Keywords matched</span>{% endif %}
+            {% if p.matched_keywords %}<span class="kw-hits" title="The category keywords that put this page in the corpus shortlist">{% for k in p.matched_keywords %}<span class="kw-hit kw-corpus">{{ k }}</span>{% endfor %}</span>
+            {% else %}<span class="kw-none">{{ 'none — GOV.UK Search only' if p.source == 'search' else '—' }}</span>{% endif %}
+          </div>
+        </div>
+        <div class="gc-side">
+          <span class="kw-hit kw-dt" title="content.document_type">{{ p.raw_document_type or '—' }}</span>
+          {% if p.parent_document_type %}<span class="kw-hit kw-dt-parent" title="Parent publication's document type (used as the effective type for html_publication pages)">parent: {{ p.parent_document_type }}</span>{% endif %}
+          {% if p.sampled %}<span class="samp" title="In the sampled minimum for this stage">sampled</span>{% endif %}
+        </div>
+      </div>
+      <div class="table-wrap">
+        <table class="gc-table">
+          <thead><tr><th class="ev-col">Evidence quotes</th>
+            <th>Phase 1 · Inclusion</th>
+            <th class="rsn-col">{% if p.p1.keep == 1 %}<span class="kd keep">Kept in Phase 1 because</span>{% elif p.p1.keep == 0 %}<span class="kd drop">Dropped at Phase 1 because</span>{% else %}Reason{% endif %}</th>
+            <th></th>
+            <th class="rsn-col">{% if p.p2 and p.p2.keep == 1 %}<span class="kd keep">Kept in shortlist because</span>{% elif p.p2 and p.p2.keep == 0 %}<span class="kd drop">Dropped at Phase 2 because</span>{% endif %}</th></tr></thead>
+          <tbody><tr>
+            <td class="ev-col">{% if p.p1.evidence %}<ul class="ev">{% for q in p.p1.evidence %}<li>“{{ q }}”</li>{% endfor %}</ul>
+              {% if p.p1.where_hit %}<div class="muted-sm">found in: {{ p.p1.where_hit|join(', ') }}</div>{% endif %}
+              {% else %}<span class="kw-none model-only">{{ 'none given' if p.p1.keep == 1 else '—' }}</span>
+              <div class="rsn blind-only" hidden>{% if p.p1.reason %}<span class="muted-sm">No quotes; the run's reason:</span> {{ p.p1.reason }}{% else %}<span class="kw-none">no quotes or reason recorded</span>{% endif %}</div>{% endif %}</td>
+            <td>{% if p.p1.keep is none %}{{ chip(None) }}{% endif %}{% if p.p1.score is not none %}<span class="sc band-{{ p.p1.band|replace('.', '_') }}" title="Score = how much of the page is about the topic (coverage)"><b>{{ '%.2f'|format(p.p1.score|float) }}</b> · {{ p.p1.confidence }}</span>{% endif %}</td>
+            <td class="rsn-col"><div class="rsn">{{ p.p1.reason or '(no reason recorded)' }}</div></td>
+            <td>{% if p.p2 %}{% if p.p2.keep is none %}{{ chip(None) }}{% endif %}{% elif p.p1.keep == 1 and not p.has_p2_run %}<span class="muted-sm">no Phase 2 run</span>{% elif p.p1.keep == 1 %}<span class="muted-sm">not reached yet</span>{% else %}<span class="muted-sm">not reached — dropped at Phase 1</span>{% endif %}</td>
+            <td class="rsn-col">{% if p.p2 %}<div class="rsn">{{ p.p2.reason or '(no reason recorded)' }}</div>{% endif %}</td>
+          </tr></tbody>
+        </table>
+      </div>
+      <div class="rate" data-verdict="" data-final="{{ 'keep' if p.final_keep else ('drop' if p.final_keep == False else '') }}"
+           data-stage="{{ p.stage or '' }}" data-votes='{{ p.votes_json }}'>
+        <span class="rate-q model-only">Was the final <b>{{ 'KEEP' if p.final_keep else ('DROP' if p.final_keep == False else '—') }}</b> right?</span>
+        <span class="rate-q blind-only" hidden>Does this page belong in the shortlist?</span>
+        <div class="rate-opts model-only" {% if p.final_keep is none %}hidden{% endif %}>
+          <button type="button" class="rate-btn" data-verdict="correct">Correct</button>
+          <button type="button" class="rate-btn" data-verdict="wrong">Wrong</button>
+          <button type="button" class="rate-btn" data-verdict="borderline">Borderline</button>
+        </div>
+        <div class="rate-opts blind-only" hidden>
+          <button type="button" class="rate-btn" data-label="in">In</button>
+          <button type="button" class="rate-btn" data-label="out">Out</button>
+          <button type="button" class="rate-btn" data-label="borderline">Borderline</button>
+        </div>
+        {% if p.final_keep is none %}<span class="muted-sm model-only">No outcome to judge (the reply could not be parsed) — switch to blind labelling to label it directly.</span>{% endif %}
+        <input type="text" class="rate-reason" placeholder="one-line reason (required)" value="" maxlength="300">
+        {% if not wizard %}<button type="button" class="btn rate-save">Save</button>
+        <button type="button" class="btn secondary-btn rate-clear" hidden>Clear my vote</button>{% endif %}
+        <span class="rate-out"></span>
+        <div class="votes" data-agreement="{{ p.agreement or '' }}" data-consensus="{{ p.label }}"></div>
+        {% if p.seed_label %}<span class="seed" title="From the category's URL-check lists — a hint, not a label">seed: {{ 'should be in' if p.seed_label == 'should_include' else 'should be out' }}</span>{% endif %}
+      </div>
+    </div>
+  {% endfor %}
+  </div>
+  {% if wizard %}
+  <div class="card wiz-nav" id="wiz-nav">
+    <button type="button" class="btn secondary-btn" id="wiz-prev">‹ Prev</button>
+    <div class="wiz-mid">
+      <div class="wiz-text"><b id="wiz-done">–</b> of <b id="wiz-total">–</b> labelled by you in the current filter · page <span id="wiz-pos">–</span></div>
+      <div class="wiz-bar"><div class="wiz-fill" id="wiz-fill" style="width:0%"></div></div>
+      <div class="muted-sm" id="wiz-note">The bar is your labelling progress; the page number is just where you are. Save &amp; Next saves this page's vote and moves on; Prev / Next also save anything you changed. ← / → keys work too.</div>
+    </div>
+    <button type="button" class="btn secondary-btn" id="wiz-next">Next ›</button>
+    <button type="button" class="btn" id="wiz-savenext" title="Save your vote on this page and go to the next one (Enter in the reason box does the same)">Save &amp; Next ›</button>
+    <button type="button" class="btn secondary-btn" id="wiz-jump" title="Go to the first page in the current filter that you have not labelled">First unlabelled</button>
+  </div>
+  {% endif %}
+  </div>{# /evaluate #}
+  {% endif %}
+
+  <style>
+    .gl-top { padding:12px 16px; display:flex; flex-wrap:wrap; gap:14px 24px; align-items:center; margin-bottom:14px; }
+    .gl-runpick { display:flex; gap:10px; align-items:center; flex:1 1 420px; }
+    .gl-runpick select { flex:1; min-width:260px; }
+    .gl-status { display:flex; gap:10px; align-items:center; flex-wrap:wrap; font-size:14px; }
+    .pill { display:inline-block; font-size:12px; font-weight:700; padding:2px 10px; border-radius:999px; background:var(--surface-3); }
+    .pill.in { background:#d9f2e4; color:var(--green-dark); } .pill.out { background:#fbe0db; color:#a5200f; }
+    .pill.bl { background:#fff1cc; color:#7a5a00; } .pill.warn { background:#fbe0db; color:#a5200f; }
+    .gl-filters { display:flex; flex-wrap:wrap; gap:8px; align-items:center; margin:0 0 14px; }
+    .gl-fl { font-size:13px; font-weight:700; color:var(--muted); }
+    .fbtn { background:var(--surface); border:1px solid var(--border-mid); border-radius:999px; padding:4px 12px; font-size:13px; font-weight:600; cursor:pointer; color:var(--ink); }
+    .fbtn.on { background:var(--blue); color:var(--white); border-color:var(--blue); }
+    .fbtn .count { display:inline-block; min-width:18px; text-align:center; background:rgba(0,0,0,.08); border-radius:999px; font-size:12px; padding:0 6px; margin-left:4px; }
+    .fbtn.on .count { background:rgba(255,255,255,.25); }
+    .gl-chk { font-size:13px; margin-left:8px; } #gl-search { min-width:220px; font-size:13px; padding:5px 8px; }
+    .gl-card { padding:12px 16px; margin:0 0 12px; }
+    .gl-card[hidden] { display:none; }
+    .gc-head { display:flex; gap:12px; align-items:flex-start; justify-content:space-between; flex-wrap:wrap; margin-bottom:8px; }
+    .gc-title a { font-weight:700; font-size:15px; } .gc-url { font-size:12px; color:var(--muted); word-break:break-all; }
+    .mono { font-family:ui-monospace,SFMono-Regular,Menlo,monospace; }
+    /* Keyword-hit lozenges (same look as the Preview page's corpus-term lozenges). */
+    .gc-kw { display:flex; align-items:center; gap:6px; flex-wrap:wrap; margin-top:4px; }
+    .gc-kw-lbl { font-size:11px; font-weight:700; text-transform:uppercase; letter-spacing:.02em; color:var(--muted); }
+    .kw-hits { display:inline-flex; flex-wrap:wrap; gap:4px; }
+    .kw-hit { display:inline-block; font-size:12px; font-weight:600; padding:1px 8px; border-radius:999px; white-space:nowrap; border:1px solid transparent; }
+    .kw-corpus { background:#eef3ff; color:var(--dark-blue,#003078); border-color:#cfe0f7; }
+    .kw-none { color:var(--muted,#6b7477); font-size:12px; }
+    .kw-dt { background:var(--surface-3,#f3f2f1); color:var(--ink,#0b0c0c); border-color:var(--border-mid,#b1b4b6); }
+    .kw-dt-parent { background:#fff1cc; color:#7a5a00; border-color:#f0d98a; }
+    .stage { font-size:11px; font-weight:700; text-transform:uppercase; letter-spacing:.03em; padding:3px 9px; border-radius:999px; white-space:nowrap; background:var(--surface-3); }
+    .stage.kept { background:#d9f2e4; color:var(--green-dark); } .stage.p1_drop { background:#fbe0db; color:#a5200f; }
+    .stage.p2_drop { background:#fbeee8; color:#8a3a1a; } .stage.p1_unparsed, .stage.p2_unparsed { background:#fff1cc; color:#7a5a00; }
+    .gc-table { font-size:14px; width:100%; } .gc-table th, .gc-table td { vertical-align:top; text-align:left; padding:6px 10px; }
+    .gc-table thead th { font-size:11px; text-transform:uppercase; letter-spacing:.02em; color:var(--muted); font-weight:700; border-bottom:1px solid var(--border); }
+    .gc-table thead th .kd { text-transform:none; letter-spacing:0; font-size:12px; }
+    .rsn-col { min-width:200px; width:28%; } .rsn { max-height:120px; overflow:auto; line-height:1.4; }
+    .kd { display:inline-block; font-size:12px; font-weight:700; padding:2px 9px; border-radius:999px; }
+    .kd.keep { background:#d9f2e4; color:var(--green-dark); } .kd.drop { background:#fbe0db; color:#a5200f; } .kd.none { background:var(--surface-3); color:var(--muted); }
+    .score { margin-left:6px; font-size:12px; font-weight:600; color:var(--muted); font-variant-numeric:tabular-nums; }
+    .sc { display:inline-block; font-size:12px; font-weight:600; padding:2px 9px; border-radius:999px; white-space:nowrap; font-variant-numeric:tabular-nums; background:var(--surface-3); color:var(--ink); }
+    .sc.band-0 { background:#f3f2f1; color:#505a5f; }                 /* Wrong sense */
+    .sc.band-0_1-0_3 { background:#fff1cc; color:#7a5a00; }           /* Mentioned in passing */
+    .sc.band-0_4-0_6 { background:#e8f1fb; color:#1d4e89; }           /* Discussed a moderate amount */
+    .sc.band-0_7-1_0 { background:#d9f2e4; color:var(--green-dark); } /* Major focus */
+    .muted-sm { color:var(--muted); font-size:13px; }
+    .topic { color:var(--blue,#1d70b8); font-size:13px; }
+    .gc-side { display:inline-flex; gap:6px; align-items:center; flex-wrap:wrap; justify-content:flex-end; }
+    .crit { margin:0 0 10px; border:1px solid var(--border); border-radius:var(--radius-sm); background:var(--surface-2); padding:6px 10px; }
+    .crit summary { cursor:pointer; font-size:13px; font-weight:700; }
+    .crit-table { width:100%; font-size:13px; margin-top:2px; border-collapse:collapse; }
+    details.crit .crit-table { margin-top:6px; }
+    .crit-table th { text-align:left; font-size:11px; text-transform:uppercase; letter-spacing:.02em; color:var(--muted); padding:4px 10px 4px 0; border-bottom:1px solid var(--border); width:50%; }
+    .crit-table td { vertical-align:top; padding:6px 10px 4px 0; white-space:pre-wrap; line-height:1.5; font-size:15px; font-style:italic; }
+    .ev-col { min-width:180px; width:22%; }
+    .ev { margin:0; padding-left:16px; font-size:13px; line-height:1.4; max-height:150px; overflow:auto; }
+    .ev li { margin:0 0 3px; }
+    .rate { display:flex; align-items:center; gap:10px; flex-wrap:wrap; margin-top:10px; border-top:1px dashed var(--border); padding-top:10px; }
+    .rate-q { font-size:13px; font-weight:700; color:var(--muted); }
+    .rate-opts { display:inline-flex; border:1px solid var(--border-mid); border-radius:999px; overflow:hidden; }
+    .rate-btn { background:var(--surface); border:none; border-right:1px solid var(--border); padding:5px 14px; font-size:13px; font-weight:600; color:var(--ink); cursor:pointer; }
+    .rate-btn:last-child { border-right:none; } .rate-btn:hover { background:var(--surface-3); }
+    .rate-btn.on { background:var(--blue); color:var(--white); } .rate-btn.on[data-verdict="wrong"] { background:#a5200f; } .rate-btn.on[data-verdict="borderline"] { background:#7a5a00; }
+    .rate-reason { flex:1 1 260px; min-width:200px; font-size:13px; padding:5px 8px; }
+    .rate-save { padding:5px 14px; font-size:13px; } .rate-clear { padding:5px 12px; font-size:13px; }
+    .rate-out { font-size:13px; } .lbl { text-transform:uppercase; } .lbl.in { color:var(--green-dark); } .lbl.out { color:#a5200f; } .lbl.borderline { color:#7a5a00; }
+    .rate-out.err { color:var(--red); }
+    .seed { margin-left:auto; font-size:12px; color:var(--muted); font-style:italic; }
+    .gl-sample { padding:12px 16px; margin-bottom:14px; }
+    .gs-head { display:flex; gap:12px; align-items:center; flex-wrap:wrap; margin-bottom:8px; }
+    .gs-table { font-size:14px; border-collapse:collapse; }
+    .gs-table th, .gs-table td { padding:4px 12px 4px 0; text-align:left; }
+    .gs-table thead th { font-size:11px; text-transform:uppercase; letter-spacing:.02em; color:var(--muted); border-bottom:1px solid var(--border); }
+    .gs-table tfoot td { border-top:1px solid var(--border); font-weight:700; }
+    .gs-table .num { text-align:right; font-variant-numeric:tabular-nums; }
+    .gs-target { width:72px; text-align:right; font-size:13px; padding:3px 6px; }
+    .gs-actions { display:flex; gap:12px; align-items:center; flex-wrap:wrap; margin-top:10px; }
+    .samp { font-size:11px; font-weight:700; text-transform:uppercase; letter-spacing:.03em; padding:3px 8px; border-radius:999px; background:#e8f1fb; color:#1d4e89; margin-left:6px; }
+    .gl-card[data-sampled="0"] .stage { opacity:.7; }
+    .wiz-nav { display:flex; gap:14px; align-items:center; padding:12px 16px; margin-top:12px; position:sticky; bottom:0; z-index:5; box-shadow:0 -2px 8px rgba(0,0,0,.06); }
+    .wiz-mid { flex:1; min-width:200px; }
+    .wiz-text { font-size:14px; }
+    .wiz-bar { height:8px; background:var(--surface-3); border-radius:999px; overflow:hidden; margin:6px 0 4px; }
+    .wiz-fill { height:100%; background:var(--blue); transition:width .2s; }
+    #wiz-prev, #wiz-next, #wiz-savenext { padding:8px 18px; white-space:nowrap; }
+    .gtabs { margin:12px 0 14px; }
+    .gtabs a.current { background:var(--white); color:var(--ink); font-weight:700; border:1px solid var(--border); border-bottom-color:var(--white); margin-bottom:-1px; }
+    .gpanel[hidden] { display:none; }
+    .gl-who { padding:10px 16px; margin-bottom:12px; }
+    .gw-row { display:flex; gap:12px; align-items:center; flex-wrap:wrap; }
+    #who { min-width:220px; font-size:13px; padding:5px 8px; }
+    .votes { flex-basis:100%; display:flex; gap:8px; flex-wrap:wrap; align-items:center; font-size:13px; }
+    .vote { display:inline-flex; gap:6px; align-items:center; border:1px solid var(--border); border-radius:var(--radius-sm); padding:3px 8px; background:var(--surface-2); }
+    .vote .lbl { font-weight:700; }
+    .vote.mine { border-color:var(--blue); }
+    .cons { font-size:11px; font-weight:700; text-transform:uppercase; letter-spacing:.03em; padding:2px 8px; border-radius:999px; background:var(--surface-3); }
+    .cons.unanimous, .cons.single { background:#d9f2e4; color:var(--green-dark); }
+    .cons.majority { background:#e8f1fb; color:#1d4e89; } .cons.split { background:#fbe0db; color:#a5200f; } .cons.adjudicated { background:#fff1cc; color:#7a5a00; }
+    body.blind .model-only, body.blind .stage, body.blind .gl-filters .fbtn[data-stage]:not([data-stage=""]) { display:none !important; }
+    /* Blind: the table keeps only the Evidence quotes column (verdicts, scores and reasons go). */
+    body.blind .gc-table th:not(.ev-col), body.blind .gc-table td:not(.ev-col) { display:none !important; }
+    body.blind .gc-table .ev-col { width:auto; }
+    .blind-banner { background:#fff1cc; border:1px solid #f0d98a; color:#7a5a00; border-radius:var(--radius); padding:10px 14px; margin:0 0 12px; font-size:14px; display:flex; align-items:center; flex-wrap:wrap; gap:6px; }
+    body.blind .blind-only { display:inline-flex !important; }
+    body.blind span.blind-only { display:inline !important; }
+    body.blind div.blind-only { display:block !important; }
+  </style>
+
+  <script>
+    const CID = {{ category.id }};
+    const RUN = {{ (run.run_id if run else '')|tojson }};
+    const ACCOUNT = {{ my_labeller|tojson }};
+    const LS_WHO = "gold_who", LS_BLIND = "gold_blind_" + CID;
+
+    // ---- who is labelling (account email, else a name remembered in this browser) ----
+    const whoInput = document.getElementById("who");
+    if (whoInput) { try { whoInput.value = localStorage.getItem(LS_WHO) || ""; } catch (e) {}
+      whoInput.onchange = () => { try { localStorage.setItem(LS_WHO, whoInput.value.trim()); } catch (e) {} renderAllVotes(); }; }
+    function me() { return ACCOUNT || (whoInput ? whoInput.value.trim() : ""); }
+
+    // ---- blind mode: hide the model's verdicts, label directly ----
+    const blindBox = document.getElementById("blind");
+    try { blindBox.checked = localStorage.getItem(LS_BLIND) === "1"; } catch (e) {}
+    function applyBlind() {
+      document.body.classList.toggle("blind", blindBox.checked);
+      const bb = document.getElementById("blind-banner"); if (bb) bb.hidden = !blindBox.checked;
+      if (blindBox.checked && stage) { stage = ""; document.querySelectorAll(".fbtn").forEach(x => x.classList.toggle("on", x.dataset.stage === "")); }
+      applyFilter();
+    }
+    blindBox.onchange = () => { try { localStorage.setItem(LS_BLIND, blindBox.checked ? "1" : "0"); } catch (e) {} applyBlind(); };
+    const blindOff = document.getElementById("blind-off"); if (blindOff) blindOff.onclick = () => { blindBox.checked = false; blindBox.onchange(); };
+
+    // ---- votes: mine drives the buttons; others appear only once I have voted ----
+    const VERDICT_OF = { keep: { in: "correct", out: "wrong" }, drop: { out: "correct", in: "wrong" } };
+    function myVerdict(wrap, label) {
+      if (!label) return "";
+      if (label === "borderline") return "borderline";
+      return (VERDICT_OF[wrap.dataset.final] || {})[label] || "";
+    }
+    function paint(card) {
+      const wrap = card.querySelector(".rate");
+      const v = wrap.dataset.verdict || "", l = wrap.dataset.mylabel || "";
+      wrap.querySelectorAll(".rate-btn[data-verdict]").forEach(b => b.classList.toggle("on", b.dataset.verdict === v));
+      wrap.querySelectorAll(".rate-btn[data-label]").forEach(b => b.classList.toggle("on", b.dataset.label === l));
+    }
+    function renderVotes(card, votes, consensus, agreement) {
+      const wrap = card.querySelector(".rate");
+      const box = wrap.querySelector(".votes");
+      const who = me();
+      const mine = votes.find(v => v.labeller === who);
+      wrap.dataset.mylabel = mine ? mine.label : "";
+      wrap.dataset.verdict = mine ? myVerdict(wrap, mine.label) : "";
+      const reason = wrap.querySelector(".rate-reason");
+      if (mine && document.activeElement !== reason) reason.value = mine.rationale || "";
+      const clrBtn = wrap.querySelector(".rate-clear"); if (clrBtn) clrBtn.hidden = !mine;
+      card.dataset.labelled = mine ? "1" : "0";
+      paint(card);
+      let html = "";
+      if (votes.length) {
+        html += `<span class="cons ${agreement || ""}">${agreement ? agreement : ""}${consensus ? " → " + consensus : ""}</span>`;
+        if (mine) votes.forEach(v => { html += `<span class="vote ${v.labeller === who ? "mine" : ""}"><span class="lbl ${v.label}">${v.label}</span> ${escapeHtml(v.labeller)}${v.blind ? " (blind)" : ""}: ${escapeHtml(v.rationale || "")}</span>`; });
+        else html += `<span class="muted-sm">${votes.length} vote${votes.length > 1 ? "s" : ""} recorded — save yours to see them</span>`;
+      }
+      box.innerHTML = html;
+    }
+    function renderAllVotes() {
+      document.querySelectorAll(".gl-card").forEach(card => {
+        const wrap = card.querySelector(".rate"); let votes = [];
+        try { votes = JSON.parse(wrap.dataset.votes || "[]"); } catch (e) {}
+        const box = wrap.querySelector(".votes");
+        renderVotes(card, votes, box.dataset.consensus || "", box.dataset.agreement || "");
+      });
+      applyFilter();
+    }
+    function escapeHtml(s) { const d = document.createElement("div"); d.textContent = s; return d.innerHTML; }
+    function setStatus(j) {
+      if (!j || !j.counts) return;
+      document.getElementById("st-labelled").textContent = j.labelled;
+      document.getElementById("st-in").textContent = j.counts.in;
+      document.getElementById("st-out").textContent = j.counts.out;
+      document.getElementById("st-bl").textContent = j.counts.borderline;
+    }
+    async function save(card, { verdict = "", label = "" } = {}) {
+      const wrap = card.querySelector(".rate");
+      const out = wrap.querySelector(".rate-out");
+      const reason = wrap.querySelector(".rate-reason").value.trim();
+      const who = me();
+      if (!who) { out.className = "rate-out err"; out.textContent = "Say who is labelling first (top of the page)."; if (whoInput) whoInput.focus(); return false; }
+      if ((verdict || label) && !reason) { out.className = "rate-out err"; out.textContent = "Add a one-line reason first."; wrap.querySelector(".rate-reason").focus(); return false; }
+      out.className = "rate-out"; out.textContent = "Saving…";
+      try {
+        const r = await fetch(`/api/categories/${CID}/gold`, {
+          method: "POST", headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ run: RUN, url: card.dataset.url, verdict, label, rationale: reason,
+                                 labeller: who, blind: blindBox.checked })
+        });
+        const j = await r.json();
+        if (!r.ok || j.error) throw new Error(j.error || ("HTTP " + r.status));
+        wrap.dataset.votes = JSON.stringify(j.votes || []);
+        const box = wrap.querySelector(".votes"); box.dataset.consensus = j.label || ""; box.dataset.agreement = j.agreement || "";
+        renderVotes(card, j.votes || [], j.label || "", j.agreement || "");
+        out.innerHTML = j.my_label ? `your vote: <b class="lbl ${j.my_label}">${j.my_label}</b>` : "your vote cleared";
+        wrap.dataset.dirty = "";
+        setStatus(j); paintProgress(j.progress); applyFilter();
+        return true;
+      } catch (e) { out.className = "rate-out err"; out.textContent = "Couldn't save: " + (e.message || e); return false; }
+    }
+    // What "save the state" means on Prev / Next: if the labeller changed anything on the card
+    // (picked a verdict or label, or edited the reason) it is saved before moving on.
+    async function commit(card) {
+      const wrap = card.querySelector(".rate");
+      if (wrap.dataset.dirty !== "1") return true;
+      if (blindBox.checked) {
+        if (!wrap.dataset.mylabel) return true;                    // nothing chosen: nothing to save
+        return save(card, { label: wrap.dataset.mylabel });
+      }
+      if (!wrap.dataset.verdict) return true;
+      return save(card, { verdict: wrap.dataset.verdict });
+    }
+    document.querySelectorAll(".gl-card").forEach(card => {
+      const wrap = card.querySelector(".rate");
+      wrap.querySelector(".rate-reason").addEventListener("input", () => { wrap.dataset.dirty = "1"; });
+      card.querySelectorAll(".rate-btn[data-verdict]").forEach(b => b.onclick = () => {
+        wrap.dataset.verdict = b.dataset.verdict; wrap.dataset.mylabel = ""; wrap.dataset.dirty = "1"; paint(card);
+        if (wrap.querySelector(".rate-reason").value.trim()) save(card, { verdict: b.dataset.verdict });
+        else wrap.querySelector(".rate-reason").focus();
+      });
+      card.querySelectorAll(".rate-btn[data-label]").forEach(b => b.onclick = () => {
+        wrap.dataset.mylabel = b.dataset.label; wrap.dataset.verdict = ""; wrap.dataset.dirty = "1"; paint(card);
+        if (wrap.querySelector(".rate-reason").value.trim()) save(card, { label: b.dataset.label });
+        else wrap.querySelector(".rate-reason").focus();
+      });
+      const saveBtn = card.querySelector(".rate-save");
+      if (saveBtn) saveBtn.onclick = () => {
+        const o = card.querySelector(".rate-out");
+        if (blindBox.checked) {
+          const l = wrap.dataset.mylabel;
+          if (!l) { o.className = "rate-out err"; o.textContent = "Pick in / out / borderline."; return; }
+          save(card, { label: l });
+        } else {
+          const v = wrap.dataset.verdict;
+          if (!v) { o.className = "rate-out err"; o.textContent = "Pick correct / wrong / borderline."; return; }
+          save(card, { verdict: v });
+        }
+      };
+      const inp = card.querySelector(".rate-reason");
+      inp.addEventListener("keydown", e => { if (e.key === "Enter") { e.preventDefault(); if (WIZARD) wizSaveNext(); else if (saveBtn) saveBtn.click(); } });
+      const clr = card.querySelector(".rate-clear"); if (clr) clr.onclick = () => save(card, {});
+    });
+
+    // ---- filters: stage · sampled minimum · unlabelled only · text ----
+    let stage = "";
+    function applyFilter() {
+      const only = document.getElementById("only-unlabelled").checked;
+      const sampledOnly = document.getElementById("only-sampled").checked;
+      const q = (document.getElementById("gl-search").value || "").trim().toLowerCase();
+      let shown = 0; const perStage = {};
+      wizOrder = [];
+      document.querySelectorAll(".gl-card").forEach(c => {
+        const inScope = (!sampledOnly || c.dataset.sampled === "1");
+        if (inScope) perStage[c.dataset.stage] = (perStage[c.dataset.stage] || 0) + 1;
+        const ok = inScope && (!stage || c.dataset.stage === stage) && (!only || c.dataset.labelled !== "1")
+          && (!q || c.dataset.hay.includes(q));
+        c.hidden = !ok; if (ok) { shown++; wizOrder.push(c); }
+      });
+      if (WIZARD) wizShow();
+      document.querySelectorAll(".fbtn[data-stage]").forEach(b => {
+        const cnt = b.querySelector(".count"); if (!cnt || !b.dataset.stage) return;
+        cnt.textContent = sampledOnly ? (perStage[b.dataset.stage] || 0) : cnt.dataset.all;
+      });
+      document.getElementById("gl-shown").textContent = shown + " shown";
+    }
+    function paintProgress(prog) {
+      if (!prog) return;
+      Object.entries(prog).forEach(([k, v]) => {
+        const row = document.querySelector(`.gs-table tr[data-stage="${k}"]`); if (!row) return;
+        row.querySelector(".gs-prog").textContent = `${v.labelled_in_sample} / ${v.target}`;
+        row.querySelector(".gs-frac").textContent = v.frac != null ? Math.round(100 * v.frac) + "%" : "—";
+      });
+    }
+    document.getElementById("only-sampled").onchange = applyFilter;
+
+    // ---- wizard: one card at a time; Prev / Next save first ----
+    const WIZARD = {{ wizard|tojson }};
+    let wizOrder = [], wizCur = null;
+    const LS_POS = "gold_wiz_" + CID + "_" + RUN;
+    const allCards = () => [...document.querySelectorAll(".gl-card")];
+    function wizShow() {
+      if (!WIZARD) return;
+      const cards = allCards();
+      if (!wizCur || !cards.includes(wizCur)) {
+        let saved = null; try { saved = localStorage.getItem(LS_POS); } catch (e) {}
+        wizCur = wizOrder.find(c => c.dataset.url === saved) || wizOrder.find(c => c.dataset.labelled !== "1") || wizOrder[0] || null;
+      }
+      cards.forEach(c => { c.hidden = c !== wizCur; });
+      const idx = wizCur ? (wizOrder.indexOf(wizCur) >= 0 ? wizOrder.indexOf(wizCur)
+                            : wizOrder.filter(c => c.compareDocumentPosition(wizCur) & Node.DOCUMENT_POSITION_FOLLOWING).length) : -1;
+      document.getElementById("wiz-pos").textContent = wizCur ? (idx + 1) : 0;
+      document.getElementById("wiz-total").textContent = wizOrder.length;
+      document.getElementById("wiz-done").textContent = wizOrder.filter(c => c.dataset.labelled === "1").length;
+      const doneN = wizOrder.filter(c => c.dataset.labelled === "1").length;
+      document.getElementById("wiz-fill").style.width = wizOrder.length ? Math.round(100 * doneN / wizOrder.length) + "%" : "0%";
+      document.getElementById("wiz-prev").disabled = !wizCur || !wizOrder.some(c => c.compareDocumentPosition(wizCur) & Node.DOCUMENT_POSITION_FOLLOWING);
+      document.getElementById("wiz-next").disabled = !wizCur || !wizOrder.some(c => c.compareDocumentPosition(wizCur) & Node.DOCUMENT_POSITION_PRECEDING);
+      if (wizCur) { try { localStorage.setItem(LS_POS, wizCur.dataset.url); } catch (e) {} }
+    }
+    async function wizSaveNext() {
+      if (!wizCur) return;
+      const wrap = wizCur.querySelector(".rate"), out = wrap.querySelector(".rate-out");
+      const chosen = blindBox.checked ? wrap.dataset.mylabel : wrap.dataset.verdict;
+      if (!chosen) { out.className = "rate-out err"; out.textContent = blindBox.checked ? "Pick in / out / borderline first." : "Pick correct / wrong / borderline first."; return; }
+      const ok = await (blindBox.checked ? save(wizCur, { label: chosen }) : save(wizCur, { verdict: chosen }));
+      if (ok) wizGo(1);
+    }
+    async function wizGo(delta) {
+      if (!wizCur) return;
+      if (!(await commit(wizCur))) return;                            // stay if the save failed
+      const after = wizOrder.filter(c => c !== wizCur && (c.compareDocumentPosition(wizCur) & Node.DOCUMENT_POSITION_PRECEDING));
+      const before = wizOrder.filter(c => c !== wizCur && (c.compareDocumentPosition(wizCur) & Node.DOCUMENT_POSITION_FOLLOWING));
+      const target = delta > 0 ? after[0] : before[before.length - 1];
+      if (!target) { document.getElementById("wiz-note").textContent = delta > 0 ? "That was the last page in this filter." : "This is the first page in this filter."; return; }
+      wizCur = target; wizShow(); window.scrollTo({ top: 0 });
+      const inp = wizCur.querySelector(".rate-reason"); if (inp) inp.focus();
+    }
+    if (WIZARD) {
+      document.getElementById("wiz-prev").onclick = () => wizGo(-1);
+      document.getElementById("wiz-next").onclick = () => wizGo(1);
+      document.getElementById("wiz-savenext").onclick = wizSaveNext;
+      document.getElementById("wiz-jump").onclick = async () => {
+        if (wizCur && !(await commit(wizCur))) return;
+        const t = wizOrder.find(c => c.dataset.labelled !== "1");
+        if (t) { wizCur = t; wizShow(); } else document.getElementById("wiz-note").textContent = "Everything in this filter is labelled.";
+      };
+      document.addEventListener("keydown", e => {
+        if (["INPUT", "TEXTAREA", "SELECT"].includes((e.target.tagName || "").toUpperCase()) && e.target.type !== "checkbox") return;
+        if (e.key === "ArrowRight") { e.preventDefault(); wizGo(1); }
+        if (e.key === "ArrowLeft") { e.preventDefault(); wizGo(-1); }
+      });
+    }
+    renderAllVotes(); applyBlind();
+
+    // ---- tabs: Setup gold run · Evaluate results ----
+    const LS_TAB = "gold_tab_" + CID;
+    const HAS_RUN = {{ (run is not none)|tojson }}, HAS_LABELS = {{ (gold_status.labelled > 0)|tojson }};
+    function showTab(name) {
+      if (name === "evaluate" && !HAS_RUN) name = "setup";
+      document.querySelectorAll(".gpanel").forEach(p => { p.hidden = p.dataset.panel !== name; });
+      document.querySelectorAll(".gtabs a").forEach(a => a.classList.toggle("current", a.dataset.tab === name));
+      try { localStorage.setItem(LS_TAB, name); } catch (e) {}
+      if (name === "evaluate" && WIZARD) wizShow();
+    }
+    document.querySelectorAll(".gtabs a").forEach(a => a.onclick = e => { e.preventDefault(); showTab(a.dataset.tab); });
+    let startTab = (location.hash || "").replace("#", "");
+    if (!["setup", "evaluate"].includes(startTab)) { try { startTab = localStorage.getItem(LS_TAB) || ""; } catch (e) {} }
+    if (!["setup", "evaluate"].includes(startTab)) startTab = HAS_LABELS ? "evaluate" : "setup";
+    showTab(startTab);
+    document.getElementById("gs-save").onclick = async () => {
+      const targets = {};
+      document.querySelectorAll(".gs-target").forEach(i => { targets[i.dataset.stage] = parseInt(i.value || "0", 10); });
+      const note = document.getElementById("gs-note"); note.textContent = "Saving…";
+      try {
+        const r = await fetch(`/api/categories/${CID}/gold/sample`, {
+          method: "POST", headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ run: RUN, targets })
+        });
+        const j = await r.json();
+        if (!r.ok || j.error) throw new Error(j.error || ("HTTP " + r.status));
+        const sampled = new Set(Object.values(j.sampled).flat());
+        document.querySelectorAll(".gl-card").forEach(c => {
+          c.dataset.sampled = sampled.has(c.dataset.url) ? "1" : "0";
+          const badge = c.querySelector(".samp");
+          if (sampled.has(c.dataset.url) && !badge) c.querySelector(".gc-head").insertAdjacentHTML("beforeend", '<span class="samp">sampled</span>');
+          if (!sampled.has(c.dataset.url) && badge) badge.remove();
+        });
+        document.getElementById("gs-total").textContent = j.sample_total;
+        paintProgress(j.progress); applyFilter();
+        note.textContent = "Saved. The picks are fixed by seed; raising a target keeps the pages already picked.";
+      } catch (e) { note.textContent = "Couldn't save: " + (e.message || e); }
+    };
+    document.querySelectorAll(".fbtn").forEach(b => b.onclick = () => {
+      stage = b.dataset.stage; document.querySelectorAll(".fbtn").forEach(x => x.classList.toggle("on", x === b)); applyFilter();
+    });
+    document.getElementById("only-unlabelled").onchange = applyFilter;
+    document.getElementById("gl-search").oninput = applyFilter;
+    if (document.getElementById("gl-shown")) applyFilter();
+  </script>
+{% endblock %}

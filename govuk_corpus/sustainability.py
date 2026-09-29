@@ -1,0 +1,241 @@
+"""Modelled sustainability impact of the AI evaluation runs.
+
+Providers don't meter per-request energy, so we ESTIMATE it: keep the raw measurements we
+already store per run (tokens in/out, cached vs fresh, cost, pages, kept), convert them to
+energy → water → CO₂ via a small, editable table of factors, and present the result as a range,
+not a false-precision point. The factors are contested and move fast, so they live here as
+plain constants (edit + bump FACTOR_VERSION) rather than being baked into the formulas.
+
+Formula per run:
+    kWh = ((fresh_in·E_in + cached_in·E_in·cache) + out·E_out) · PUE · (1+embodied) / 3.6e6
+    water_L = kWh · L_per_kWh
+    CO2_kg  = kWh · grid_kg_per_kWh
+"""
+from __future__ import annotations
+
+from typing import Dict, Optional
+
+from .backend import db
+
+_P = "%s" if db.__name__.endswith("db_pg") else "?"
+
+# Version the factor set so older figures stay comparable / explainable. Bump on any change.
+FACTOR_VERSION = "2026-09-20.1"
+
+# Each factor: (point, low, high). Illustrative, adjustable — see the notes shown in the UI.
+FACTORS = {
+    "e_in_j_per_tok":  (0.30, 0.10, 1.00),   # energy per INPUT token (J)
+    "e_out_j_per_tok": (1.50, 0.50, 5.00),   # energy per OUTPUT token (J) — output costs more
+    "cache_factor":    (0.25, 0.10, 0.50),   # cached input tokens use a fraction of the compute
+    "pue":             (1.20, 1.10, 1.50),   # data-centre overhead (cooling, networking, idle)
+    "water_l_per_kwh": (1.00, 0.30, 2.00),   # litres of water per kWh (region-dependent)
+    "grid_kg_per_kwh": (0.20, 0.05, 0.40),   # grid carbon intensity kg CO₂e/kWh (region-dependent)
+    "embodied_uplift": (0.00, 0.00, 0.30),   # optional hardware-manufacturing uplift (off by default)
+}
+
+FACTOR_LABELS = {
+    "e_in_j_per_tok":  "Energy per input token",
+    "e_out_j_per_tok": "Energy per output token",
+    "cache_factor":    "Cached-token energy fraction",
+    "pue":             "Data-centre overhead (PUE)",
+    "water_l_per_kwh": "Water used per unit of energy",
+    "grid_kg_per_kwh": "Grid carbon intensity",
+    "embodied_uplift": "Hardware manufacturing uplift",
+}
+
+FACTOR_UNITS = {
+    "e_in_j_per_tok":  "joules / token",
+    "e_out_j_per_tok": "joules / token",
+    "cache_factor":    "× (share of full compute)",
+    "pue":             "× (multiplier)",
+    "water_l_per_kwh": "litres / kWh",
+    "grid_kg_per_kwh": "kg CO₂e / kWh",
+    "embodied_uplift": "× (added on top)",
+}
+
+FACTOR_NOTES = {
+    "e_in_j_per_tok":  "Vendor disclosures + academic estimates vary widely (Google's 2025 per-prompt figure ≈ 0.24 Wh).",
+    "e_out_j_per_tok": "Output tokens are roughly 3–10× the energy of input tokens.",
+    "cache_factor":    "Prompt caching avoids recomputing the prompt — cached input is cheaper in cost and energy.",
+    "pue":             "Power Usage Effectiveness — the data centre's non-compute overhead.",
+    "water_l_per_kwh": "On-site cooling plus indirect (electricity) water; heavily region-dependent.",
+    "grid_kg_per_kwh": "Grid intensity: UK ≈ 0.20, US avg ≈ 0.40, some regions < 0.05. Use the provider region if known.",
+    "embodied_uplift": "Hardware manufacturing footprint; often omitted. Off by default — flag if included.",
+}
+
+
+def _pt(name: str) -> float:
+    return FACTORS[name][0]
+
+
+def _impact_at(intok, outtok, hit, miss, idx: int) -> Dict[str, float]:
+    """kWh / water / CO₂ using the point (idx 0), low (1) or high (2) value of every factor."""
+    intok, outtok, hit, miss = int(intok or 0), int(outtok or 0), int(hit or 0), int(miss or 0)
+    fresh, cached = miss, hit
+    if fresh + cached == 0 and intok:        # no cache split recorded -> treat all input as fresh
+        fresh = intok
+    f = lambda k: FACTORS[k][idx]
+    j_in = fresh * f("e_in_j_per_tok") + cached * f("e_in_j_per_tok") * f("cache_factor")
+    j_out = outtok * f("e_out_j_per_tok")
+    kwh = (j_in + j_out) * f("pue") * (1 + f("embodied_uplift")) / 3.6e6
+    return {"kwh": kwh, "water_l": kwh * f("water_l_per_kwh"), "co2_kg": kwh * f("grid_kg_per_kwh")}
+
+
+def impact(intok, outtok, hit, miss) -> Dict[str, Dict[str, float]]:
+    """{'point':…, 'low':…, 'high':…} each with kwh / water_l / co2_kg."""
+    return {"point": _impact_at(intok, outtok, hit, miss, 0),
+            "low": _impact_at(intok, outtok, hit, miss, 1),
+            "high": _impact_at(intok, outtok, hit, miss, 2)}
+
+
+def equivalences(kwh: float, water_l: float, co2_kg: float) -> list:
+    """Everyday anchors for a kWh / water / CO₂ figure (nobody intuits '0.4 Wh').
+
+    Each anchor is tagged with the ``metric`` it belongs beside (energy / water / co2) and an
+    ``icon`` (emoji) so the UI can show it next to the matching headline card."""
+    wh = kwh * 1000.0
+    ml = water_l * 1000.0
+    g = co2_kg * 1000.0
+    out = [
+        ("energy", "📱", "phone charges", wh / 10.0, "a full charge ≈ 10 Wh"),
+        ("energy", "🫖", "kettles boiled", wh / 100.0, "boiling a kettle ≈ 100 Wh"),
+        ("energy", "🔍", "web searches", wh / 0.3, "a web search ≈ 0.3 Wh"),
+        ("water", "🥤", "cups of water", ml / 250.0, "a cup ≈ 250 mL"),
+        ("co2", "🚗", "km driven", g / 120.0, "a petrol car ≈ 120 g CO₂e/km"),
+    ]
+    return [{"metric": m, "icon": ic, "label": l, "value": v, "note": n}
+            for m, ic, l, v, n in out]
+
+
+def _per_mtok(d: dict) -> Optional[Dict[str, float]]:
+    """Average cost / energy / water / CO₂ per one million tokens processed (in + out).
+    Lets you compare models like-for-like regardless of how much each was run.
+
+    Cost uses ``metered_cost`` — the cost of runs that actually recorded token counts — so a
+    run that logged a cost but no tokens (missing usage data) can't distort the average by
+    attributing its spend to a tiny denominator. Energy/water/CO₂ are already token-derived, so
+    a zero-token run contributes nothing to them anyway."""
+    toks = float(d.get("intok") or 0) + float(d.get("outtok") or 0)
+    if toks <= 0:
+        return None
+    scale = 1_000_000.0 / toks
+    pt = d["impact"]["point"]
+    metered = d.get("metered_cost", d["cost"])
+    return {"cost": metered * scale, "kwh": pt["kwh"] * scale,
+            "water_l": pt["water_l"] * scale, "co2_kg": pt["co2_kg"] * scale}
+
+
+def _agg_row(conn, where: str = "", params: tuple = ()) -> dict:
+    row = conn.execute(
+        f"SELECT COUNT(*) AS runs, COALESCE(SUM(cost),0) AS cost, "
+        f"COALESCE(SUM(in_tokens),0) AS intok, COALESCE(SUM(out_tokens),0) AS outtok, "
+        f"COALESCE(SUM(hit_tokens),0) AS hit, COALESCE(SUM(miss_tokens),0) AS miss, "
+        f"COALESCE(SUM(pages),0) AS pages, COALESCE(SUM(kept),0) AS kept "
+        f"FROM evaluation_runs {where}", params).fetchone()
+    d = dict(row)
+    for k in ("cost", "intok", "outtok", "hit", "miss", "pages", "kept"):
+        d[k] = float(d.get(k) or 0)
+    d["impact"] = impact(d["intok"], d["outtok"], d["hit"], d["miss"])
+    return d
+
+
+def summary(conn) -> dict:
+    """Whole-application sustainability summary from evaluation_runs: totals + modelled impact
+    (with range), per-model and per-phase breakdowns, and per-page / per-included-page
+    derived figures."""
+    total = _agg_row(conn)
+
+    def _grouped(select_cols: str, group_by: str) -> list:
+        rows = []
+        # `metered_cost` / `untracked_*` split cost by whether the run recorded any tokens, so
+        # per-1M averages can ignore cost that has no usage data behind it (CASE, not FILTER,
+        # for sqlite/postgres portability).
+        tok_expr = "(COALESCE(in_tokens,0)+COALESCE(out_tokens,0))"
+        for r in conn.execute(
+                f"SELECT {select_cols}, COUNT(*) AS runs, COALESCE(SUM(cost),0) AS cost, "
+                f"COALESCE(SUM(in_tokens),0) AS intok, COALESCE(SUM(out_tokens),0) AS outtok, "
+                f"COALESCE(SUM(hit_tokens),0) AS hit, COALESCE(SUM(miss_tokens),0) AS miss, "
+                f"COALESCE(SUM(pages),0) AS pages, COALESCE(SUM(kept),0) AS kept, "
+                f"COALESCE(SUM(CASE WHEN {tok_expr}>0 THEN cost ELSE 0 END),0) AS metered_cost, "
+                f"COALESCE(SUM(CASE WHEN {tok_expr}=0 AND cost>0 THEN 1 ELSE 0 END),0) AS untracked_runs, "
+                f"COALESCE(SUM(CASE WHEN {tok_expr}=0 AND cost>0 THEN cost ELSE 0 END),0) AS untracked_cost "
+                f"FROM evaluation_runs GROUP BY {group_by} ORDER BY SUM(cost) DESC").fetchall():
+            d = dict(r)
+            for k in ("cost", "intok", "outtok", "hit", "miss", "pages", "kept",
+                      "metered_cost", "untracked_runs", "untracked_cost"):
+                d[k] = float(d.get(k) or 0)
+            d["impact"] = impact(d["intok"], d["outtok"], d["hit"], d["miss"])
+            d["per_mtok"] = _per_mtok(d)
+            rows.append(d)
+        return rows
+
+    by_model = _grouped("COALESCE(provider,'?') AS provider, COALESCE(model,'?') AS model",
+                        "provider, model")
+    by_phase = _grouped("COALESCE(phase,'—') AS phase", "phase")
+    pages, kept = total["pages"] or 0, total["kept"] or 0
+    derived = {
+        "cost_per_page": (total["cost"] / pages) if pages else None,
+        "cost_per_included": (total["cost"] / kept) if kept else None,
+        "kwh_per_page": (total["impact"]["point"]["kwh"] / pages) if pages else None,
+        "co2_g_per_page": (total["impact"]["point"]["co2_kg"] * 1000 / pages) if pages else None,
+        "cached_share": (total["hit"] / total["intok"]) if total["intok"] else None,
+        "tokens_per_page": ((total["intok"] + total["outtok"]) / pages) if pages else None,
+    }
+    return {"total": total, "by_model": by_model, "by_phase": by_phase, "derived": derived,
+            "equivalences": equivalences(total["impact"]["point"]["kwh"],
+                                         total["impact"]["point"]["water_l"],
+                                         total["impact"]["point"]["co2_kg"]),
+            "data_issues": data_issues(conn),
+            "factor_version": FACTOR_VERSION,
+            "factors": [{"key": k, "label": FACTOR_LABELS.get(k, k),
+                         "unit": FACTOR_UNITS.get(k, ""), "point": v[0], "low": v[1], "high": v[2],
+                         "note": FACTOR_NOTES.get(k, "")} for k, v in FACTORS.items()]}
+
+
+def data_issues(conn) -> list:
+    """Runs that logged a cost but no token usage (in + out = 0).
+
+    Their spend can't be tied to any tokens, so it is left out of the per-1M averages and
+    surfaced here for repair — the usage was likely never captured from the provider response.
+    Read-only: this reports the runs, it does not modify them."""
+    tok = "(COALESCE(in_tokens,0)+COALESCE(out_tokens,0))"
+    rows = conn.execute(
+        f"SELECT run_id, category_id, COALESCE(provider,'?') AS provider, "
+        f"COALESCE(model,'?') AS model, COALESCE(phase,'—') AS phase, "
+        f"COALESCE(cost,0) AS cost, COALESCE(pages,0) AS pages "
+        f"FROM evaluation_runs WHERE COALESCE(cost,0) > 0 AND {tok} = 0 "
+        f"ORDER BY cost DESC").fetchall()
+    out = []
+    for r in rows:
+        d = dict(r)
+        d["cost"], d["pages"] = float(d.get("cost") or 0), int(d.get("pages") or 0)
+        out.append(d)
+    return out
+
+
+def main() -> None:
+    """CLI: list evaluation runs that recorded a cost but no token counts."""
+    import argparse
+    ap = argparse.ArgumentParser(
+        description="Flag evaluation_runs that logged a cost but no token usage (in+out = 0).")
+    ap.add_argument("--db", default="data/pilot.db", help="SQLite path (ignored for Postgres)")
+    args = ap.parse_args()
+    conn = db.connect(args.db)
+    try:
+        issues = data_issues(conn)
+    finally:
+        pass
+    if not issues:
+        print("No zero-token cost runs found.")
+        return
+    total = sum(i["cost"] for i in issues)
+    print(f"{len(issues)} run(s) recorded a cost but no token counts "
+          f"(total ${total:.2f} of untracked spend):\n")
+    for i in issues:
+        print(f"  {i['run_id']:24}  {i['provider']}/{i['model']:20}  {i['phase']:22}  "
+              f"${i['cost']:.4f}  pages={i['pages']:<5}  category={i['category_id']}")
+    conn.close()
+
+
+if __name__ == "__main__":
+    main()

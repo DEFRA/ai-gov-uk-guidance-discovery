@@ -1,0 +1,294 @@
+"""Saved shortlist specs ("categories") — CRUD + validation, backend-agnostic.
+
+A category is a saved query: filter fields (dept_slugs, document_type_slugs,
+keywords) that execute against the corpus, plus inference fields
+(inclusion/exclusion context, adjudication hints, URL overrides) stored for the
+downstream LLM phases. Persisted in the `categories` table on the active backend.
+
+No Streamlit here — pure functions so they can be unit-tested on SQLite.
+"""
+from __future__ import annotations
+
+import re
+import time
+from typing import Any, Dict, List, Optional
+
+from .backend import db
+
+_IS_PG = db.__name__.endswith("db_pg")
+_P = "%s" if _IS_PG else "?"
+
+# User-editable fields, in storage order.
+USER_FIELDS = [
+    "slug", "owner_email", "description", "dept_slugs", "include_child_orgs",
+    "document_type_slugs", "keywords",
+    "inclusion_context", "exclusion_context", "adjudication_hints_keep",
+    "adjudication_hints_drop", "extra_guidance_urls", "only_use_extra_guidance_urls",
+    "extra_law_urls", "only_use_extra_law_urls", "hybrid_on_save",
+]
+REQUIRED_FIELDS = [
+    "owner_email", "description", "inclusion_context",
+]
+MAX_LEN = {
+    "slug": 64,
+    "description": 100, "dept_slugs": 2000, "document_type_slugs": 2000, "keywords": 2000,
+    "inclusion_context": 2000, "exclusion_context": 2000, "adjudication_hints_keep": 2000,
+    "adjudication_hints_drop": 2000, "extra_guidance_urls": 10000, "extra_law_urls": 10000,
+}
+_EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+SLUG_RE = re.compile(r"^[a-z0-9_-]+$")
+
+
+def prettify(slug: Optional[str]) -> str:
+    """Turn a slug into a human display name, e.g. animal_liquid_waste or
+    farm-slurry-storage -> 'Animal Liquid Waste' / 'Farm Slurry Storage'."""
+    return (slug or "").replace("_", " ").replace("-", " ").strip().title()
+
+
+def slugify(name: Optional[str]) -> str:
+    """A filename-safe slug derived from a free-text name (lowercase, alphanumerics -> hyphens).
+    The category is identified by its `id` everywhere; this slug is only for export filenames and
+    copy-naming, so it needn't be unique or stable."""
+    s = re.sub(r"[^a-z0-9]+", "-", (name or "").lower()).strip("-")
+    return s[:64]
+
+
+def display_name(category: Dict[str, Any]) -> str:
+    """The human name to show: the free-text name (stored in `description`), falling back to a
+    prettified slug for older records, then 'Untitled'."""
+    return (category.get("description") or "").strip() or prettify(category.get("slug")) or "Untitled"
+
+
+_LABELS = {
+    "slug": "Name for this category",
+    "owner_email": "Owner Email", "description": "Name", "dept_slugs": "Departments",
+    "include_child_orgs": "Include child organisations",
+    "document_type_slugs": "Document Types", "keywords": "Keyword Search",
+    "inclusion_context": "Include description", "exclusion_context": "Exclude description",
+    "adjudication_hints_keep": "Keep Keywords", "adjudication_hints_drop": "Drop Keywords",
+    "extra_guidance_urls": "Include Guidance URLs",
+    "only_use_extra_guidance_urls": "Only Use Extra Guidance URLs",
+    "extra_law_urls": "Include LAW URLs", "only_use_extra_law_urls": "Only Use Extra LAW URLs",
+    "hybrid_on_save": "Run GOV.UK hybrid search on save",
+}
+
+
+def label(field: str) -> str:
+    return _LABELS.get(field, field)
+
+
+def now_iso() -> str:
+    return db.now_iso()
+
+
+def validate(data: Dict[str, Any]) -> List[str]:
+    """Return a list of human-readable validation errors ([] means valid)."""
+    errors: List[str] = []
+    for f in REQUIRED_FIELDS:
+        if not str(data.get(f) or "").strip():
+            errors.append(f"{label(f)} is required.")
+    # Organisations / page types / keywords are each optional (empty = search everything
+    # at that stage), but at least one must bound the shortlist — otherwise it would be
+    # the whole corpus.
+    if (not str(data.get("dept_slugs") or "").strip()
+            and not str(data.get("document_type_slugs") or "").strip()
+            and not str(data.get("keywords") or "").strip()):
+        errors.append("Set at least one filter — organisations, page types or keywords — "
+                      "otherwise the shortlist would be the whole corpus.")
+    email = str(data.get("owner_email") or "").strip()
+    if email and not _EMAIL_RE.match(email):
+        errors.append("Please enter a valid email address.")
+    slug = str(data.get("slug") or "").strip()
+    if "slug" in data and not slug:
+        errors.append("Name for this category is required.")
+    elif slug and not SLUG_RE.match(slug):
+        errors.append("Name must be lowercase letters, numbers, hyphens and underscores only.")
+    for f, limit in MAX_LEN.items():
+        v = data.get(f)
+        if v and len(str(v)) > limit:
+            errors.append(f"{label(f)} must be {limit} characters or less.")
+    # Keywords: one term per line or comma-separated. Multi-word terms match as an adjacent
+    # phrase (phraseto_tsquery), so terms of any length are allowed — no word-count limit.
+    return errors
+
+
+def _coerce(data: Dict[str, Any]) -> Dict[str, Any]:
+    out = dict(data)
+    for b in ("only_use_extra_guidance_urls", "only_use_extra_law_urls", "include_child_orgs",
+              "hybrid_on_save"):
+        out[b] = 1 if str(data.get(b) or "0") in ("1", "Y", "y", "True", "true", "on") else 0
+    return out
+
+
+def create_category(conn, data: Dict[str, Any]) -> int:
+    d = _coerce(data)
+    cid = int(time.time() * 1000)
+    # Guard against PK collisions when two categories are created in the same
+    # millisecond (e.g. copying a category twice in quick succession).
+    while conn.execute(f"SELECT 1 FROM categories WHERE id={_P}", (cid,)).fetchone():
+        cid += 1
+    ts = now_iso()
+    cols = ["id", "created_at", "updated_at"] + USER_FIELDS
+    vals = [cid, ts, ts] + [d.get(f) for f in USER_FIELDS]
+    ph = ",".join([_P] * len(cols))
+    conn.execute(f"INSERT INTO categories ({','.join(cols)}) VALUES ({ph})", tuple(vals))
+    conn.commit()
+    return cid
+
+
+def update_category(conn, cid: int, data: Dict[str, Any]) -> None:
+    d = _coerce(data)
+    # Only write the fields the caller actually submitted (present in `data`), so fields the
+    # form doesn't carry — e.g. the extra_guidance/law URL lists — are preserved rather than
+    # blanked. Checks the raw `data`, not the coerced `d`, because _coerce injects the boolean
+    # keys even when they were absent.
+    fields = [f for f in USER_FIELDS if f in data]
+    sets = {**{f: d.get(f) for f in fields}, "updated_at": now_iso()}
+    assignments = ",".join(f"{k}={_P}" for k in sets)
+    conn.execute(f"UPDATE categories SET {assignments} WHERE id={_P}",
+                 tuple(sets.values()) + (cid,))
+    conn.commit()
+
+
+# The fields the shortlist form edits that define the shortlist and what a run evaluates. A
+# change to any of these means the shortlist should be rebuilt and re-run; Name, slug and owner
+# do not. (The extra_guidance/law URL fields are not on this form, so they're not compared here.)
+SHORTLIST_PARAM_FIELDS = (
+    "dept_slugs", "include_child_orgs", "document_type_slugs", "keywords",
+    "inclusion_context", "exclusion_context", "adjudication_hints_keep", "adjudication_hints_drop",
+)
+# Fields compared order-insensitively as sets of tokens (a reorder isn't a real change).
+_LIST_PARAM_FIELDS = frozenset(("dept_slugs", "document_type_slugs", "keywords"))
+
+
+def shortlist_params_changed(old: Dict[str, Any], new_data: Dict[str, Any]) -> bool:
+    """True when any shortlist-defining field differs between the stored category `old` and the
+    submitted `new_data` (both coerced) — i.e. the shortlist needs rebuilding and a fresh run.
+    List fields (organisations, document types, keywords, URL lists) are compared as sets, so a
+    reorder alone doesn't count. Name / slug / owner changes return False."""
+    a, b = _coerce(old), _coerce(new_data)
+    for f in SHORTLIST_PARAM_FIELDS:
+        if f in _LIST_PARAM_FIELDS:
+            if set(parse_list(a.get(f))) != set(parse_list(b.get(f))):
+                return True
+        else:
+            va = a.get(f); vb = b.get(f)
+            va = va.strip() if isinstance(va, str) else ("" if va is None else va)
+            vb = vb.strip() if isinstance(vb, str) else ("" if vb is None else vb)
+            if va != vb:
+                return True
+    return False
+
+
+def set_url_checklist(conn, cid: int, should_include_urls: str, should_exclude_urls: str) -> None:
+    """Persist the URL-check lists (guc-0018) for a category. These are managed only on the
+    URL check page — the category form doesn't carry them — so this updates just these two
+    columns and leaves every other field untouched."""
+    conn.execute(
+        f"UPDATE categories SET should_include_urls={_P}, should_exclude_urls={_P}, "
+        f"updated_at={_P} WHERE id={_P}",
+        ((should_include_urls or "").strip() or None,
+         (should_exclude_urls or "").strip() or None, now_iso(), cid))
+    conn.commit()
+
+
+# The inference criteria fields the two AI phases fill their prompts from (see
+# evaluate.prompt_spec_json) — a subset of USER_FIELDS. NOT filter fields, so changing them
+# does not alter the shortlist membership, only what the next run's prompt says.
+CRITERIA_FIELDS = ("inclusion_context", "exclusion_context",
+                   "adjudication_hints_keep", "adjudication_hints_drop")
+
+
+def update_criteria(conn, cid: int, fields: Dict[str, Any]) -> List[str]:
+    """Update ONLY the criteria columns given in `fields`, leaving every other field untouched
+    (unlike update_category, which overwrites the whole form). Keys outside CRITERIA_FIELDS are
+    ignored; a blank value stores NULL. Returns the list of columns changed from their current
+    value (so the caller can tell whether anything actually moved). No shortlist rebuild is
+    needed — these are inference-only fields."""
+    row = conn.execute(f"SELECT * FROM categories WHERE id={_P}", (cid,)).fetchone()
+    if not row:
+        return []
+    current = dict(row)
+    updates = {k: ((str(fields[k]).strip() or None)) for k in CRITERIA_FIELDS if k in fields}
+    changed = [k for k, v in updates.items() if (current.get(k) or None) != v]
+    if not changed:
+        return []
+    sets = {k: updates[k] for k in changed}
+    sets["updated_at"] = now_iso()
+    assignments = ",".join(f"{k}={_P}" for k in sets)
+    conn.execute(f"UPDATE categories SET {assignments} WHERE id={_P}",
+                 tuple(sets.values()) + (cid,))
+    conn.commit()
+    return changed
+
+
+def delete_category(conn, cid: int) -> None:
+    """Delete a shortlist and everything scoped to it — its AI runs and per-page results,
+    the audit rows, the cached page counts, and the stored shortlist / GOV.UK-search
+    membership — then the category itself. One transaction; irreversible."""
+    for tbl in ("evaluation_results", "evaluation_runs", "category_audit",
+                "category_page_counts", "category_shortlist_pages", "category_search_pages"):
+        conn.execute(f"DELETE FROM {tbl} WHERE category_id={_P}", (cid,))
+    conn.execute(f"DELETE FROM categories WHERE id={_P}", (cid,))
+    conn.commit()
+
+
+def _copy_slug(conn, base: str) -> str:
+    """A distinct slug for a duplicate: `<base>-copy`, then `-copy-2`, `-copy-3`…
+    Category slugs aren't DB-unique, but keeping copies distinct keeps the list readable."""
+    base = (base or "category").strip()[:56]  # leave room for the "-copy-N" suffix (≤64)
+    rows = conn.execute("SELECT slug FROM categories").fetchall()
+    taken = {(dict(r).get("slug") or "").strip() for r in rows}
+    cand = f"{base}-copy"
+    if cand not in taken:
+        return cand
+    i = 2
+    while f"{base}-copy-{i}" in taken:
+        i += 1
+    return f"{base}-copy-{i}"
+
+
+def copy_category(conn, cid: int, owner_email: Optional[str] = None) -> Optional[int]:
+    """Duplicate a category's rules into a new one. Returns the new id, or None if
+    the source is missing. The copy gets a fresh, distinct slug (`<slug>-copy`) and
+    carries over every rule field — including the URL-check lists, which live outside
+    USER_FIELDS. Pass owner_email to reassign the copy to the current user."""
+    src = get_category(conn, cid)
+    if not src:
+        return None
+    data = {f: src.get(f) for f in USER_FIELDS}
+    data["slug"] = _copy_slug(conn, src.get("slug") or "")
+    if owner_email:
+        data["owner_email"] = owner_email
+    new_id = create_category(conn, data)
+    inc = (src.get("should_include_urls") or "").strip()
+    exc = (src.get("should_exclude_urls") or "").strip()
+    if inc or exc:
+        set_url_checklist(conn, new_id, inc, exc)
+    return new_id
+
+
+def get_category(conn, cid: int) -> Optional[Dict[str, Any]]:
+    row = conn.execute(f"SELECT * FROM categories WHERE id={_P}", (cid,)).fetchone()
+    return dict(row) if row else None
+
+
+def list_categories_query():
+    """(sql, params) for the categories list — so the page can show the SQL it ran."""
+    return ("SELECT id, slug, description, owner_email, dept_slugs, document_type_slugs, "
+            "created_at, updated_at "
+            "FROM categories ORDER BY created_at DESC", [])
+
+
+def list_categories(conn) -> List[Dict[str, Any]]:
+    sql, params = list_categories_query()
+    rows = conn.execute(sql, tuple(params)).fetchall()
+    return [dict(r) for r in rows]
+
+
+def parse_list(value: Optional[str]) -> List[str]:
+    """Split a comma/newline-separated field into clean tokens (for filters)."""
+    if not value:
+        return []
+    parts = re.split(r"[,\n]", value)
+    return [p.strip() for p in parts if p.strip()]

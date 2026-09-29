@@ -1,0 +1,225 @@
+{% extends "base.html" %}
+{% from "_category_tabs.html" import category_tabs with context %}
+{% from "_sql.html" import sql_panel %}
+{% from "_crumbs.html" import crumbs %}
+{% set page_ref = "guc-0004" %}
+{% block page_id %}{{ page_ref }}{% endblock %}
+{% block title %}{{ category.display_name }} — shortlist{% endblock %}
+{% block content %}
+  <style>
+    /* Roll-down disclosure: a clickable bar with a chevron that rotates when open. */
+    summary.rolldown { display:inline-flex; align-items:center; gap:10px; cursor:pointer;
+      list-style:none; font-weight:700; font-size:15px; color:var(--blue);
+      padding:9px 14px; border:1px solid var(--border-mid); border-radius:var(--radius-sm);
+      background:var(--surface-2); width:max-content; max-width:100%; margin:0; }
+    summary.rolldown::-webkit-details-marker { display:none; }
+    summary.rolldown::before { content:"›"; font-size:18px; line-height:1; color:var(--muted);
+      transition:transform .15s ease; transform:rotate(0deg); }
+    details[open] > summary.rolldown::before { transform:rotate(90deg); }
+    summary.rolldown:hover { background:var(--surface-3); border-color:var(--muted); }
+    /* Per-row "links off this page" roll-down. */
+    .lx-h { width:22px; }
+    .lx-toggle { cursor:pointer; color:var(--blue); font-weight:700; text-align:center; user-select:none; width:22px; }
+    .lx-toggle:hover { color:var(--dark-blue,#003078); }
+    .lx-panel { padding:4px 4px 8px 4px; font-size:13px; }
+    .lx-panel ul { margin:6px 0 0; padding-left:18px; max-height:300px; overflow:auto; }
+    .lx-panel li { margin:2px 0; word-break:break-all; }
+    .lx-ext { font-size:11px; color:var(--muted); background:var(--surface-2); padding:1px 5px; border-radius:3px; margin-left:6px; }
+    tr.lx-row > td { background:var(--surface-2); }
+  </style>
+
+  {{ crumbs([("Shortlists", url_for('list_categories_page')), (category.display_name, none)]) }}
+  <h1 style="margin:20px 0 20px;">{{ category.display_name }}</h1>
+
+  {{ category_tabs(category, 'results') }}
+
+  <div class="tabpanel">
+    <section id="tab-shortlist" class="subpanel" role="tabpanel">
+      <h2 style="margin-top:10px;">Shortlist</h2>
+      <p class="hint" style="margin-top:-14px;">Browse and extract the pages at any stage of the funnel. Choose a
+        stage and the fields to show; the same fields pre-fill the download (customise it there).</p>
+      <div class="controls" style="align-items:center;gap:12px;">
+        <label data-level="advanced">Stage
+          <select id="audit-stage" style="font-size:15px;padding:6px;border:2px solid var(--black);">
+            {% for k, lbl in audit_stages %}<option value="{{ k }}" {{ 'selected' if k == (stage or 'final') }}>{{ lbl }}</option>{% endfor %}
+          </select>
+        </label>
+        <label data-level="advanced" title="Which run's decisions to show. 'Active run' uses the shortlist's current run.">Run
+          <select id="audit-run" style="font-size:15px;padding:6px;border:2px solid var(--black);">
+            <option value="">Active run</option>
+            {% for r in runs %}<option value="{{ r.run_id }}" {{ 'selected' if r.run_id == run }}>{{ r.label }}</option>{% endfor %}
+          </select>
+        </label>
+        <input id="audit-search" type="search" placeholder="Search titles…"
+          style="padding:8px 10px;border:2px solid var(--black);border-radius:5px;min-width:220px;font:inherit;">
+        <button class="btn secondary-btn" id="audit-download" type="button">Download…</button>
+        <button class="btn secondary-btn" id="retry-unparsable" type="button" data-level="advanced"
+          title="Re-ask the model for pages whose reply couldn't be parsed (Unscored). Uses API credit.">↻ Retry unparsable</button>
+        <span id="retry-status" class="secondary" data-level="advanced"></span>
+      </div>
+      <details style="margin:6px 0 14px;max-width:960px;">
+        <summary class="rolldown">Select Columns for Display or download</summary>
+        <div class="col-picker">
+          {% for section, section_fields in audit_sections %}
+          <div>
+            <div class="secondary" style="font-weight:700;font-size:13px;margin-bottom:6px;">{{ section }}</div>
+            {% for key, label, default_on, disabled, warning in section_fields %}{% if key != 'content' %}
+            <label class="check"{% if warning %} title="{{ warning }}"{% endif %}>
+              <input type="checkbox" class="audit-col" value="{{ key }}" {{ 'checked' if (default_on and key != 'url') else '' }}> {{ label }}{% if warning %} <span class="secondary" style="font-size:12px;">⚠</span>{% endif %}
+            </label>
+            {% endif %}{% endfor %}
+          </div>
+          {% endfor %}
+        </div>
+      </details>
+      <p class="secondary" id="audit-count" style="margin:0 0 8px;"></p>
+      <div style="overflow-x:auto;"><table id="audit-table" style="font-size:14px;"><thead></thead><tbody></tbody></table></div>
+      <p id="audit-empty" class="secondary" hidden>No pages at this stage.</p>
+      {{ sql_panel("audit-sql") }}
+      <div id="audit-pager" class="controls" style="margin-top:12px;align-items:center;" hidden>
+        <button class="btn secondary-btn" id="audit-prev" type="button">‹ Prev</button>
+        <span id="audit-range" class="secondary"></span>
+        <button class="btn secondary-btn" id="audit-next" type="button">Next ›</button>
+      </div>
+    </section>
+  </div>
+
+  <script>
+    const CID = {{ category.id }};
+    // Field-key -> label + stage-key -> label for the Audit Shortlist.
+    const AUDIT_LABELS = { {% for s, fs in audit_sections %}{% for k, l, d, dis, w in fs %}"{{ k }}": "{{ l }}", {% endfor %}{% endfor %} };
+    const AUDIT_STAGE_LABELS = { {% for k, lbl in audit_stages %}"{{ k }}": "{{ lbl }}", {% endfor %} };
+    const fmtInt = n => Number(n || 0).toLocaleString();
+    function esc(s) { const d = document.createElement("div"); d.textContent = s == null ? "" : s; return d.innerHTML; }
+
+    // ---- Shortlist sub-tab -------------------------------------------------
+    const AUDIT_PAGE = 50;
+    let auditOffset = 0, auditTotal = 0;
+    function auditFields() {
+      return [...document.querySelectorAll(".audit-col:checked")].map(c => c.value);
+    }
+    function auditCell(k, r) {
+      const v = r[k];
+      if (k === "url") return `<a href="${esc(v)}">${esc(v)}</a>`;
+      if (k === "title") return v == null ? "—" : `<a href="${esc(r.url)}">${esc(v)}</a>`;
+      if (k === "public_updated_at" || k === "first_published_at") return v ? esc(String(v).slice(0, 10)) : "—";
+      if (k === "exclusion_reason") return (v == null || v === "") ? "—" : esc(v).replace(/\n/g, "<br>");
+      return (v == null || v === "") ? "—" : esc(v);
+    }
+    async function loadAudit() {
+      const stage = document.getElementById("audit-stage").value;
+      const run = (document.getElementById("audit-run") || {}).value || "";
+      const q = document.getElementById("audit-search").value.trim();
+      const params = new URLSearchParams({ stage, limit: AUDIT_PAGE, offset: auditOffset, q });
+      if (run) params.set("run", run);
+      auditFields().forEach(f => params.append("fields", f));
+      const cnt = document.getElementById("audit-count");
+      cnt.innerHTML = '<span class="spinner"></span> Loading…';
+      const table = document.getElementById("audit-table");
+      try {
+        const j = await (await fetch(`/api/categories/${CID}/audit-shortlist?${params}`)).json();
+        if (j.error) { cnt.textContent = "Error: " + j.error; return; }
+        if (window.setSqlPanel) setSqlPanel("audit-sql", j.sql);
+        if (j.no_data) {
+          cnt.textContent = j.message || "No data at this stage yet.";
+          table.hidden = true; document.getElementById("audit-empty").hidden = true;
+          document.getElementById("audit-pager").hidden = true; return;
+        }
+        // export_rows always returns url first (needed for the title link); only *show* the
+        // url column when it's ticked, so it defaults off in the table but downloads still key on it.
+        const urlOn = !!document.querySelector('.audit-col[value="url"]:checked');
+        const keys = (j.keys || []).filter(k => k !== "url" || urlOn), rows = j.rows || [];
+        auditTotal = j.total;
+        document.querySelector("#audit-table thead").innerHTML =
+          "<tr><th class=\"lx-h\"></th>" + keys.map(k => `<th>${esc(AUDIT_LABELS[k] || k)}</th>`).join("") + "</tr>";
+        document.querySelector("#audit-table tbody").innerHTML =
+          rows.map(r => `<tr><td class="lx-toggle" data-url="${esc(r.url)}" title="Show the links off this page">▸</td>`
+            + keys.map(k => `<td>${auditCell(k, r)}</td>`).join("") + "</tr>").join("");
+        table.hidden = rows.length === 0;
+        document.getElementById("audit-empty").hidden = rows.length !== 0;
+        const known = auditTotal != null;
+        const from = rows.length ? auditOffset + 1 : 0, to = auditOffset + rows.length;
+        cnt.textContent = `${AUDIT_STAGE_LABELS[stage] || stage} · `
+          + (known ? `${fmtInt(auditTotal)} pages` : `${fmtInt(to)}+ pages`)
+          + (q ? ` matching “${q}”` : "");
+        document.getElementById("audit-range").textContent =
+          `${fmtInt(from)}–${fmtInt(to)}` + (known ? ` of ${fmtInt(auditTotal)}` : "");
+        document.getElementById("audit-prev").disabled = auditOffset <= 0;
+        document.getElementById("audit-next").disabled = known ? (auditOffset + AUDIT_PAGE >= auditTotal) : (rows.length < AUDIT_PAGE);
+        document.getElementById("audit-pager").hidden = auditOffset === 0 && rows.length < AUDIT_PAGE;
+      } catch (e) { cnt.textContent = "Could not load."; }
+    }
+    // Per-row roll-down: show every link off the page (from the stored corpus content).
+    document.getElementById("audit-table").addEventListener("click", async (e) => {
+      const tog = e.target.closest(".lx-toggle");
+      if (!tog) return;
+      const tr = tog.closest("tr");
+      const nxt = tr.nextElementSibling;
+      if (nxt && nxt.classList.contains("lx-row")) { nxt.remove(); tog.textContent = "▸"; return; }
+      tog.textContent = "▾";
+      const exp = document.createElement("tr"); exp.className = "lx-row";
+      const cell = document.createElement("td"); cell.colSpan = tr.children.length;
+      cell.innerHTML = '<span class="spinner"></span> Loading links…';
+      exp.appendChild(cell); tr.insertAdjacentElement("afterend", exp);
+      try {
+        const j = await (await fetch("/api/page-links?url=" + encodeURIComponent(tog.dataset.url))).json();
+        const links = j.links || [];
+        if (!links.length) {
+          cell.innerHTML = '<span class="secondary">' + (j.no_content ? "No stored content for this page." : "No links found on this page.") + '</span>';
+          return;
+        }
+        const panel = document.createElement("div"); panel.className = "lx-panel";
+        const h = document.createElement("strong");
+        h.textContent = links.length + " link" + (links.length === 1 ? "" : "s") + " off this page";
+        panel.appendChild(h);
+        const ul = document.createElement("ul");
+        links.forEach(l => {
+          const li = document.createElement("li");
+          const a = document.createElement("a"); a.href = l.href; a.target = "_blank"; a.rel = "noopener"; a.textContent = l.text;
+          li.appendChild(a);
+          if (l.external) { const x = document.createElement("span"); x.className = "lx-ext"; x.textContent = "external"; li.appendChild(x); }
+          ul.appendChild(li);
+        });
+        panel.appendChild(ul); cell.innerHTML = ""; cell.appendChild(panel);
+      } catch (e2) { cell.innerHTML = '<span class="secondary">Could not load links.</span>'; }
+    });
+
+    function auditReload() { auditOffset = 0; loadAudit(); }
+    document.getElementById("audit-stage").addEventListener("change", auditReload);
+    { const rs = document.getElementById("audit-run"); if (rs) rs.addEventListener("change", auditReload); }
+    document.getElementById("audit-search").addEventListener("keydown", e => { if (e.key === "Enter") { e.preventDefault(); auditReload(); } });
+    document.querySelectorAll(".audit-col").forEach(c => c.addEventListener("change", auditReload));
+    document.getElementById("audit-prev").addEventListener("click", () => { auditOffset = Math.max(0, auditOffset - AUDIT_PAGE); loadAudit(); });
+    document.getElementById("audit-next").addEventListener("click", () => { auditOffset += AUDIT_PAGE; loadAudit(); });
+    document.getElementById("audit-download").addEventListener("click", () => {
+      const params = new URLSearchParams({ stage: document.getElementById("audit-stage").value });
+      const run = (document.getElementById("audit-run") || {}).value || "";
+      if (run) params.set("run", run);
+      auditFields().forEach(f => params.append("fields", f));
+      window.location.href = `/categories/${CID}/download?${params}`;
+    });
+
+    // Retry unparsable (keep IS NULL) pages of the latest run chain, in place — a diagnostic to
+    // see whether they clear on a second ask (transient) or fail again (a real problem).
+    document.getElementById("retry-unparsable").addEventListener("click", async () => {
+      if (!confirm("Re-ask the model for pages whose reply couldn't be parsed, in the latest "
+        + "inclusion and exclusion runs. This uses API credit. Continue?")) return;
+      const btn = document.getElementById("retry-unparsable"), st = document.getElementById("retry-status");
+      btn.disabled = true; st.textContent = "Retrying…";
+      try {
+        const j = await (await fetch(`/api/categories/${CID}/retry-unparsable`, { method: "POST" })).json();
+        if (j.error) { st.textContent = "Error: " + j.error; return; }
+        if (!j.retried) { st.textContent = "Nothing to retry — no unparsable pages."; return; }
+        const per = (j.phases || []).map(p => `${p.phase}: ${p.now_parsed}/${p.retried} parsed, ${p.still_unparsable} still`).join(" · ");
+        st.textContent = `Retried ${j.retried}: ${j.now_parsed} now parsed, ${j.still_unparsable} still unparsable `
+          + `($${(j.cost_usd || 0).toFixed(2)}). ${per}`;
+        loadAudit();   // refresh the table (decisions may have changed)
+      } catch (e) { st.textContent = "Could not retry."; }
+      finally { btn.disabled = false; }
+    });
+
+    // The Shortlist page now shows only the pages list (GDS Compliance moved to its own
+    // page), so load it straight away — no sub-tabs to switch between.
+    loadAudit();
+  </script>
+{% endblock %}

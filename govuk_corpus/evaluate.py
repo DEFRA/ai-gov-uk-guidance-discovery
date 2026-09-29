@@ -1,0 +1,1341 @@
+"""AI inclusion-pass evaluation of a category's shortlist, tracked per run.
+
+Each run has a fixed model/provider, so different models can be compared over the
+same shortlist. A run's per-page decisions live in `evaluation_results` keyed by
+(run_id, url); run totals (pages, kept, dropped, cost, time) live in
+`evaluation_runs`. Prompt building + response parsing are pure (testable); the web
+app makes the API calls and drives runs.
+"""
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+import re
+import socket
+import time
+import uuid
+from datetime import datetime, timezone
+from typing import Dict, List, Optional, Sequence
+
+from .backend import db
+from . import shortlist
+
+_IS_PG = db.__name__.endswith("db_pg")
+_P = "%s" if _IS_PG else "?"
+
+BODY_CHAR_LIMIT = 20000   # ~5k tokens of body; covers ~97% of pages in full (median page ~600 chars)
+
+_TRUNC_MARKER = "\n\n…[middle of page trimmed]…\n\n"
+
+
+def truncate_body(body: str, limit: int = BODY_CHAR_LIMIT) -> str:
+    """Fit a page body into `limit` chars, keeping the HEAD and the TAIL (dropping the middle)
+    when it's too long — so a long page's ending (summaries, related links, the actual topic
+    if it appears late) isn't lost the way a plain head-only cut loses it. Short pages are
+    returned unchanged."""
+    body = body or ""
+    if len(body) <= limit:
+        return body
+    keep = limit - len(_TRUNC_MARKER)
+    if keep <= 0:                       # pathologically small limit: just take the head
+        return body[:limit]
+    head = (keep * 2) // 3              # 2:1 head:tail — the topic is usually introduced early
+    tail = keep - head
+    return body[:head] + _TRUNC_MARKER + body[len(body) - tail:]
+
+PHASE_INCLUSION = "Phase 1 - Inclusion"
+PHASE_EXCLUSION = "Phase 2 - Exclusion"
+
+# Execution mode for a phase's inference. Synchronous = one blocking API call per
+# page (the current behaviour). Batch = submit the whole phase as one asynchronous
+# job via the Anthropic Message Batches API (~50% cheaper; Anthropic models only —
+# DeepSeek's endpoint has no batch API, so a DeepSeek phase always runs synchronously).
+MODE_SYNC = "synchronous"
+MODE_BATCH = "batch"
+PHASE_MODES = (MODE_SYNC, MODE_BATCH)
+
+
+def normalise_mode(value: Optional[str]) -> str:
+    """Coerce a stored/form value to a valid mode, defaulting to synchronous."""
+    return MODE_BATCH if (value or "").strip().lower() == MODE_BATCH else MODE_SYNC
+
+
+# Editable prompt templates. The wording lives here (and can be overridden by a saved version —
+# see govuk_corpus/prompts.py); the {{PLACEHOLDERS}} are filled in per page by the build_* helpers.
+# The grounding rules (evidence quotes, primary topic, observable score anchors) make the decision
+# checkable: every quote must appear verbatim in the page, keep == (score > 0), and the primary
+# topic gives Phase 2 the page's real subject to test against the exclusion criteria.
+_INCLUSION_RULES = (
+    "Rules\n"
+    "- Base your decision ONLY on the page text. Do not use outside knowledge about this page or GOV.UK.\n"
+    "- If the content is truncated, judge what is visible. Do not assume the missing part is relevant.\n"
+    "- A page is relevant if any part of it concerns the topic in the described sense.\n"
+    "- If the topic in the described sense is NOT mentioned anywhere in the page text, it is not relevant.\n\n"
+    "Evidence (required)\n"
+    "- Quote the passages that show the topic in the described sense, as EXACT substrings copied from the "
+    "page text — no paraphrasing, each at most 25 words.\n"
+    "- If you cannot quote at least one such passage, you must return keep=false and score=0.0.\n\n"
+    "Primary topic (required)\n"
+    "- State what the page is MAINLY about, as a noun phrase of at most 10 words.\n"
+    "- It must be consistent with the page title and description. Only if the title is generic "
+    "(for example \"Annex B\" or \"Schedule 3\") derive it from the first heading or paragraph of the content.\n"
+    "- Describe the page's actual subject. Do not restate the INCLUDE topic unless the page is genuinely "
+    "mainly about it.\n\n"
+    "Score = how much of the page is about the topic (coverage), not your confidence:\n"
+    "- 0.7–1.0: the topic (in the described sense) appears in the title or description, OR is the subject "
+    "of most of the page\n"
+    "- 0.4–0.6: it appears in two or more distinct passages of the body, but not in the title or description\n"
+    "- 0.1–0.3: exactly one passing mention in the body\n"
+    "- 0.0: not mentioned in the described sense (including not mentioned at all) — the only case for keep=false\n\n"
+    "keep must be true if and only if score > 0.\n\n"
+    "Return ONLY this JSON object, with exactly these keys and no prose:\n"
+    '{"keep": true|false, "score": 0.0-1.0, "where": ["title"|"description"|"body", ...], '
+    '"evidence": ["exact quote", ...], "primary_topic": "noun phrase, at most 10 words", '
+    '"reason": "one sentence: which sense matched and how much of the page it covers"}')
+
+DEFAULT_INCLUSION_TEMPLATE = (
+    "You are assessing whether a GOV.UK page is relevant to a topic.\n\n"
+    "Topic to INCLUDE (keep pages about this, in the sense described):\n{{INCLUDE}}\n\n"
+    "The topic may have other meanings. Only mentions in the sense described above count.\n\n"
+    "Page title: {{TITLE}}\n"
+    "Page description: {{DESCRIPTION}}\n\n"
+    "Page content (may be truncated):\n{{BODY}}\n\n"
+    + _INCLUSION_RULES)
+
+# Phase 2 is a plain fill of EXCLUSION_FIELDS: the structure (labelled criteria, always-shown
+# example sections, the title line) is written HERE, not assembled in Python, so it can be
+# rearranged or relabelled by editing the template alone. Empty values render as their fallbacks.
+DEFAULT_EXCLUSION_TEMPLATE = (
+    "You curate a GOV.UK corpus for a {{NAME_UPPER}} audit. A fast first pass flagged this "
+    "page because it looked relevant; it forces KEEP on any mention. Remove ONLY pages that "
+    "are clearly not about {{NAME}} at all. Missing a genuinely {{NAME}}-relevant page is "
+    "unacceptable; keeping a borderline one is fine. Default to KEEP.\n\n"
+    "=== {{NAME_UPPER}} SPEC ===\n"
+    "Inclusion criteria:\n{{INCLUDE}}\n\n"
+    "Exclusion criteria:\n{{EXCLUDE}}\n"
+    "=== END SPEC ===\n\n"
+    "Apply the inclusion and exclusion criteria above.\n"
+    "KEEP (keep = true) — keep if the page has any audit-relevant {{NAME}} content, even briefly.\n"
+    "DROP (keep = false) — drop ONLY when the page is clearly out of scope per the exclusion "
+    "criteria (homonyms, incidental-only mentions, wrong domain).\n\n"
+    "KEEP examples (keep = true) — lean toward keeping when similar content appears:\n{{KEEP}}\n\n"
+    "DROP examples (keep = false) — drop only when clearly similar to:\n{{DROP}}\n\n"
+    "If you are unsure, KEEP.\n\n"
+    "For context, the first pass wrote this note (it may be wrong): {{PASS1_REASON}}\n"
+    "The first pass judged the page is mainly about: {{PASS1_TOPIC}}\n"
+    "Use the primary topic as a hint, not a verdict: test it against the exclusion criteria. A page "
+    "whose primary topic is clearly outside scope and whose only link to {{NAME}} is an incidental "
+    "mention should be dropped; if the primary topic is in scope, or you are unsure, KEEP.\n\n"
+    "Page title: {{TITLE}}\nPage content (may be truncated):\n{{BODY}}\n\n"
+    "Return ONLY a JSON object, no prose:\n"
+    '{"keep": true|false, "exclusion_hit": "none"|"incidental"|"homonym"|"wrong_domain", '
+    '"reason": "1-2 sentence explanation"}')
+
+
+# ---- Cached prompt variant (A/B trial) -----------------------------------
+# The same wording, reordered so ALL the stable instruction text comes first and the per-page
+# content comes last, separated by PROMPT_SPLIT. The caller sends the stable half as the (cacheable)
+# system prompt and the page half as the user message — so a run's repeated prefix is a cache-read
+# on Anthropic, and DeepSeek's automatic prefix cache kicks in too. `current` variant is unchanged.
+PROMPT_SPLIT = "\n\n<<<PAGE>>>\n\n"
+
+DEFAULT_INCLUSION_TEMPLATE_CACHED = (
+    "You are assessing whether a GOV.UK page is relevant to a topic.\n\n"
+    "Topic to INCLUDE (keep pages about this, in the sense described):\n{{INCLUDE}}\n\n"
+    "The topic may have other meanings. Only mentions in the sense described above count.\n\n"
+    + _INCLUSION_RULES
+    + PROMPT_SPLIT +
+    "Page title: {{TITLE}}\nPage description: {{DESCRIPTION}}\n\n"
+    "Page content (may be truncated):\n{{BODY}}")
+
+DEFAULT_EXCLUSION_TEMPLATE_CACHED = (
+    "You curate a GOV.UK corpus for a {{NAME_UPPER}} audit. A fast first pass flagged this "
+    "page because it looked relevant; it forces KEEP on any mention. Remove ONLY pages that "
+    "are clearly not about {{NAME}} at all. Missing a genuinely {{NAME}}-relevant page is "
+    "unacceptable; keeping a borderline one is fine. Default to KEEP.\n\n"
+    "=== {{NAME_UPPER}} SPEC ===\n"
+    "Inclusion criteria:\n{{INCLUDE}}\n\n"
+    "Exclusion criteria:\n{{EXCLUDE}}\n"
+    "=== END SPEC ===\n\n"
+    "Apply the inclusion and exclusion criteria above.\n"
+    "KEEP (keep = true) — keep if the page has any audit-relevant {{NAME}} content, even briefly.\n"
+    "DROP (keep = false) — drop ONLY when the page is clearly out of scope per the exclusion "
+    "criteria (homonyms, incidental-only mentions, wrong domain).\n\n"
+    "KEEP examples (keep = true) — lean toward keeping when similar content appears:\n{{KEEP}}\n\n"
+    "DROP examples (keep = false) — drop only when clearly similar to:\n{{DROP}}\n\n"
+    "If you are unsure, KEEP.\n\n"
+    "Return ONLY a JSON object, no prose:\n"
+    '{"keep": true|false, "exclusion_hit": "none"|"incidental"|"homonym"|"wrong_domain", '
+    '"reason": "1-2 sentence explanation"}'
+    + PROMPT_SPLIT +
+    "For context, the first pass wrote this note (it may be wrong): {{PASS1_REASON}}\n"
+    "The first pass judged the page is mainly about: {{PASS1_TOPIC}}\n"
+    "Use the primary topic as a hint, not a verdict: test it against the exclusion criteria. A page "
+    "whose primary topic is clearly outside scope and whose only link to {{NAME}} is an incidental "
+    "mention should be dropped; if the primary topic is in scope, or you are unsure, KEEP.\n\n"
+    "Page title: {{TITLE}}\nPage content (may be truncated):\n{{BODY}}")
+
+
+def cached_template(name: str) -> str:
+    """The reordered (stable-prefix) default template for a phase — 'inclusion' | 'exclusion'."""
+    return DEFAULT_EXCLUSION_TEMPLATE_CACHED if name == "exclusion" else DEFAULT_INCLUSION_TEMPLATE_CACHED
+
+
+def split_cached(filled: str):
+    """(stable, variable) for a filled cached template. If it carries no PROMPT_SPLIT marker (e.g.
+    a non-cached template), the whole thing is the variable half with an empty stable prefix."""
+    stable, sep, variable = filled.partition(PROMPT_SPLIT)
+    return (stable, variable) if sep else ("", filled)
+
+
+def _fill(template: str, values: Dict[str, str]) -> str:
+    """Substitute {{KEY}} tokens (str.replace, so literal { } in the text are left alone)."""
+    out = template
+    for k, v in values.items():
+        out = out.replace("{{" + k + "}}", v)
+    return out
+
+
+# ---- Generic prompt rendering ---------------------------------------------
+# Each phase declares its ATOMIC fields: placeholder -> (source, key, fallback). `source` is
+# "spec" (the shortlist's definition: contexts, hints, name) or "page" (per-page values). The
+# renderer does a plain fill and nothing else, so a template owns its structure entirely by where
+# it places these tokens. Every field has a fallback, so an empty value still renders (e.g.
+# "(none)") instead of a section silently vanishing — the template author decides what shows.
+INCLUSION_FIELDS = {
+    "INCLUDE":     ("spec", "inclusion",   "(not specified)"),
+    "EXCLUDE":     ("spec", "exclusion",   "(none given)"),   # legacy inclusion templates only
+    "TITLE":       ("page", "title",       "(none)"),
+    "DESCRIPTION": ("page", "description", "(none)"),
+    "BODY":        ("page", "body",        "(no body text)"),
+}
+EXCLUSION_FIELDS = {
+    "NAME":         ("spec", "name",        "the topic"),
+    "NAME_UPPER":   ("spec", "name_upper",  "THE TOPIC"),
+    "INCLUDE":      ("spec", "inclusion",   "(not specified)"),
+    "EXCLUDE":      ("spec", "exclusion",   "(none given)"),
+    "KEEP":         ("spec", "keep_hints",  "(none)"),
+    "DROP":         ("spec", "drop_hints",  "(none)"),
+    "PASS1_REASON": ("page", "pass1_reason", "(none)"),
+    "PASS1_TOPIC":  ("page", "pass1_topic",  "(not given)"),
+    "TITLE":        ("page", "title",       "(none)"),
+    "DESCRIPTION":  ("page", "description", "(none)"),
+    "BODY":         ("page", "body",        "(no body text)"),
+}
+
+# Composite tokens that older exclusion templates carried. Their structure used to be assembled
+# in Python; new templates write that structure themselves from the atomic fields. The shim below
+# still resolves them so a run stamped with an old template reproduces byte-for-byte.
+_LEGACY_TOKENS = ("{{SPEC}}", "{{KEEP_SECTION}}", "{{DROP_SECTION}}", "{{TITLE_LINE}}")
+
+
+def _legacy_composites(values: Dict[str, str], spec: Dict, page: Dict) -> Dict[str, str]:
+    """The old Python-assembled blocks, built exactly as the previous builder did (conditional
+    sections, repr()'d pass-1 note), for templates that still reference them."""
+    keep, drop = spec.get("keep_hints") or "", spec.get("drop_hints") or ""
+    title = page.get("title") or ""
+    return {
+        "SPEC": "Inclusion criteria:\n" + values["INCLUDE"] + "\n\nExclusion criteria:\n" + values["EXCLUDE"],
+        "KEEP_SECTION": ("\nKEEP examples (keep = true) — lean toward keeping when similar "
+                         f"content appears:\n{keep}\n") if keep else "",
+        "DROP_SECTION": ("\nDROP examples (keep = false) — drop only when clearly similar to:\n"
+                         f"{drop}\n") if drop else "",
+        "TITLE_LINE": f"Page title: {title}\n" if title else "",
+        "PASS1_REASON": repr(page.get("pass1_reason") or ""),
+    }
+
+
+def render_phase_prompt(fields: Dict, template: str, spec: Dict, page: Dict) -> str:
+    """Fill `template` from the phase's atomic `fields`: a plain substitution of each placeholder
+    with its value (or fallback when empty). No phase-specific assembly — the only extra is the
+    legacy shim, applied solely when the template carries an old composite token."""
+    values: Dict[str, str] = {}
+    for token, (source, key, fallback) in fields.items():
+        raw = (spec if source == "spec" else page).get(key)
+        val = "" if raw is None else str(raw)
+        values[token] = val if val != "" else fallback
+    if any(t in template for t in _LEGACY_TOKENS):
+        values.update(_legacy_composites(values, spec, page))
+    return _fill(template, values)
+
+
+def template_fingerprint(text: Optional[str]) -> str:
+    """Short content hash (8 hex chars) of a prompt template: same fingerprint <=> same prompt
+    text. Stamped on each run beside the git SHA — which changes on ANY commit, so it can't tell
+    you whether the prompt itself changed; this can. '' for an empty/missing template."""
+    if not text:
+        return ""
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()[:8]
+
+
+def build_prompt(inclusion: str, exclusion: str, title: str, description: str,
+                 body: str, body_limit: int = BODY_CHAR_LIMIT, template: Optional[str] = None) -> str:
+    """Phase 1 prompt: a plain fill of INCLUSION_FIELDS (see render_phase_prompt)."""
+    spec = {"inclusion": (inclusion or "").strip(), "exclusion": (exclusion or "").strip()}
+    page = {"title": title, "description": description, "body": truncate_body(body, body_limit)}
+    return render_phase_prompt(INCLUSION_FIELDS, template or DEFAULT_INCLUSION_TEMPLATE, spec, page)
+
+
+def _iter_json_spans(text: str):
+    """Yield each top-level balanced ``{...}`` substring, string/escape aware — so a ``}``
+    inside a quoted value doesn't end the span, and reasoning prose around the object is
+    skipped rather than swept in."""
+    depth = 0
+    start = -1
+    in_str = False
+    esc = False
+    for i, ch in enumerate(text):
+        if in_str:
+            if esc:
+                esc = False
+            elif ch == "\\":
+                esc = True
+            elif ch == '"':
+                in_str = False
+            continue
+        if ch == '"':
+            in_str = True
+        elif ch == "{":
+            if depth == 0:
+                start = i
+            depth += 1
+        elif ch == "}" and depth > 0:
+            depth -= 1
+            if depth == 0 and start >= 0:
+                yield text[start:i + 1]
+                start = -1
+
+
+def _extract_json_object(text: str, prefer_keys=("keep",)) -> Optional[Dict]:
+    """The model's decision object, recovered even when wrapped in reasoning/prose.
+
+    Tries the whole reply first, then each balanced ``{...}`` span it contains, and returns the
+    LAST valid object that carries an expected key — a reasoning model tends to emit its verdict
+    after the reasoning. Replaces a greedy first-'{'-to-last-'}' regex that grabbed prose (and
+    any stray braces in it) and then failed to parse."""
+    if not text:
+        return None
+    t = text.strip()
+    if t.startswith("```"):
+        t = t.split("\n", 1)[-1].rsplit("```", 1)[0].strip()
+    candidates: List[Dict] = []
+    try:
+        obj = json.loads(t)                       # clean reply: whole thing is the object
+        if isinstance(obj, dict):
+            candidates.append(obj)
+    except (ValueError, TypeError):
+        pass
+    if not candidates:                            # prose-wrapped: scan for embedded objects
+        for span in _iter_json_spans(t):
+            try:
+                obj = json.loads(span)
+            except (ValueError, TypeError):
+                continue
+            if isinstance(obj, dict):
+                candidates.append(obj)
+    if not candidates:
+        return None
+    for obj in reversed(candidates):
+        if any(k in obj for k in prefer_keys):
+            return obj
+    return candidates[-1]
+
+
+def _json_list(v) -> Optional[str]:
+    """A reply field that should be a list (evidence quotes, where-hit fields) as a JSON string for
+    storage; a bare string is wrapped; anything else is None. Capped so a runaway reply can't bloat."""
+    if v is None:
+        return None
+    if isinstance(v, str):
+        v = [v]
+    if not isinstance(v, (list, tuple)):
+        return None
+    return json.dumps([str(x)[:500] for x in v][:50], ensure_ascii=False)
+
+
+def parse_decision(text: str) -> Optional[Dict]:
+    """Parse the model reply into {keep, score, reason, primary_topic, where_hit, evidence}, or None
+    if unparseable. The last three are the grounding fields the inclusion template asks for
+    (primary_topic: what the page is mainly about; where_hit: which fields carried the match;
+    evidence: verbatim quotes). They are None for replies that don't carry them (exclusion-phase or
+    legacy runs), so older results keep parsing unchanged."""
+    d = _extract_json_object(text, prefer_keys=("keep",))
+    if d is None:
+        return None
+    keep = d.get("keep")
+    try:
+        score = float(d.get("score")) if d.get("score") is not None else None
+    except (ValueError, TypeError):
+        score = None
+    topic = d.get("primary_topic")
+    return {"keep": 1 if keep else 0 if keep is not None else None,
+            "score": score, "reason": str(d.get("reason") or "")[:1000],
+            "primary_topic": (str(topic).strip()[:200] or None) if topic is not None else None,
+            "where_hit": _json_list(d.get("where")),
+            "evidence": _json_list(d.get("evidence"))}
+
+
+# Inclusion-score bands -> a plain-English confidence label, matching the scoring rubric in
+# DEFAULT_INCLUSION_TEMPLATE (0 = wrong sense; 0.1-0.3 in passing; 0.4-0.6 moderate; 0.7-1.0 major).
+def confidence_label(score) -> str:
+    """The confidence label for an inclusion score (how central the topic is to the page).
+    Empty string when there's no score (page not evaluated / unparseable)."""
+    if score is None:
+        return ""
+    try:
+        s = float(score)
+    except (ValueError, TypeError):
+        return ""
+    if s <= 0:
+        return "Wrong sense"
+    if s <= 0.35:
+        return "Mentioned in passing"
+    if s <= 0.65:
+        return "Discussed a moderate amount"
+    return "Major focus"
+
+
+# ---- Phase 2: Exclusion --------------------------------------------------
+# Recall-priority second pass over the pages the inclusion run KEPT. It re-introduces
+# the exclusion criteria and only ever turns a keep into a drop (removing false
+# positives). Adapted from the DEFRA guidance-relevance-filter adjudication pass.
+def build_exclusion_prompt(name: str, inclusion: str, exclusion: str,
+                           keep_hints: str, drop_hints: str, title: str, body: str,
+                           pass1_reason: str, body_limit: int = BODY_CHAR_LIMIT,
+                           template: Optional[str] = None, *, pass1_topic: str = "") -> str:
+    """Phase 2 prompt: a plain fill of EXCLUSION_FIELDS (see render_phase_prompt). A template
+    stamped before the atomic fields still renders byte-for-byte via the legacy shim."""
+    nm = (name or "the topic").strip()
+    spec = {"name": nm, "name_upper": nm.upper(),
+            "inclusion": (inclusion or "").strip(), "exclusion": (exclusion or "").strip(),
+            "keep_hints": (keep_hints or "").strip(), "drop_hints": (drop_hints or "").strip()}
+    page = {"title": title, "body": truncate_body(body, body_limit),
+            "pass1_reason": pass1_reason, "pass1_topic": (pass1_topic or "").strip()}
+    return render_phase_prompt(EXCLUSION_FIELDS, template or DEFAULT_EXCLUSION_TEMPLATE, spec, page)
+
+
+def parse_exclusion(text: str) -> Optional[Dict]:
+    """Parse an exclusion reply into a save_page decision {keep, score, reason}, tagging
+    the reason with the exclusion_hit category. None if unparseable/missing verdict."""
+    d = _extract_json_object(text, prefer_keys=("keep",))
+    if d is None:
+        return None
+    keep = d.get("keep")
+    if keep is None:
+        return None
+    hit = str(d.get("exclusion_hit") or "").strip()
+    reason = str(d.get("reason") or d.get("verdict_reason") or "")[:1000]
+    if hit and hit.lower() != "none":
+        reason = f"[{hit}] {reason}".strip()
+    return {"keep": 1 if keep else 0, "score": None, "reason": reason}
+
+
+def json_list_display(val) -> str:
+    """A stored JSON list (evidence quotes, where-hit fields) as readable text for tables and
+    exports: items joined with ' | '. Empty -> ''; non-JSON input passes through unchanged."""
+    if not val:
+        return ""
+    try:
+        items = json.loads(val)
+    except (ValueError, TypeError):
+        return str(val)
+    return " | ".join(str(x) for x in items) if isinstance(items, list) else str(items)
+
+
+# The model's exclusion_hit categories -> the display label shown as a header line above the
+# reason. parse_exclusion (above) tags an excluded page's stored reason with a leading [hit];
+# an untagged reason is a page that survived the exclusion pass -> "KEPT" (exclusion_hit "none").
+EXCLUSION_HIT_LABELS = {
+    "incidental": "Excluded as Incidental",
+    "homonym": "Excluded as homonym",
+    "wrong_domain": "Excluded as wrong domain",
+}
+
+
+def exclusion_label(reason) -> "tuple[str, str]":
+    """(label, clean_reason) for a stored exclusion-run reason: map its leading [hit] tag to the
+    display label and strip the tag; an untagged reason -> ("KEPT", reason unchanged)."""
+    r = str(reason or "")
+    m = re.match(r"\s*\[([a-z_]+)\]\s*", r, re.I)
+    if m:
+        label = EXCLUSION_HIT_LABELS.get(m.group(1).lower())
+        if label:
+            return label, r[m.end():]
+    return "KEPT", r
+
+
+def exclusion_display(reason):
+    """'label\\nclean_reason' for a non-empty exclusion reason (header line + body), left as-is
+    (falsy) when there is no exclusion reason. Single source for the funnel/audit tables and
+    the CSV/XLSX/JSON exports so every surface shows the same exclusion_hit label."""
+    if not reason:
+        return reason
+    label, clean = exclusion_label(reason)
+    return f"{label}\n{clean}"
+
+
+def latest_inclusion_run(conn, category_id: int) -> Optional[str]:
+    """The most recent Phase-1 inclusion run for a category (its keeps feed exclusion)."""
+    row = conn.execute(
+        f"SELECT run_id FROM evaluation_runs WHERE category_id = {_P} AND phase = {_P} "
+        f"ORDER BY started_at DESC LIMIT 1", (category_id, PHASE_INCLUSION)).fetchone()
+    return row["run_id"] if row else None
+
+
+def latest_exclusion_run(conn, source_run_id: str) -> Optional[str]:
+    """The most recent Phase-2 exclusion run built on a given inclusion run."""
+    row = conn.execute(
+        f"SELECT run_id FROM evaluation_runs WHERE source_run_id = {_P} AND phase = {_P} "
+        f"ORDER BY started_at DESC LIMIT 1", (source_run_id, PHASE_EXCLUSION)).fetchone()
+    return row["run_id"] if row else None
+
+
+def kept_count(conn, run_id: str) -> int:
+    return conn.execute(
+        f"SELECT COUNT(*) AS c FROM evaluation_results WHERE run_id = {_P} AND keep = 1",
+        (run_id,)).fetchone()["c"]
+
+
+def exclusion_candidates(conn, run_id: str, source_run_id: str, limit: int) -> List[dict]:
+    """Next `limit` pages the source (inclusion) run kept that this exclusion run has not
+    yet re-evaluated. Carries the inclusion pass's reason as pass1_reason."""
+    sql = (
+        "SELECT c.url AS url, c.title AS title, c.description AS description, "
+        "c.search_text AS body, c.content_hash AS content_hash, "
+        "r.reason AS pass1_reason, r.primary_topic AS pass1_topic "
+        "FROM evaluation_results r JOIN content c ON c.url = r.url "
+        f"WHERE r.run_id = {_P} AND r.keep = 1 "
+        f"AND r.url NOT IN (SELECT url FROM evaluation_results WHERE run_id = {_P}) "
+        f"ORDER BY r.url LIMIT {_P}")
+    return [dict(x) for x in conn.execute(sql, (source_run_id, run_id, limit)).fetchall()]
+
+
+# ---- runs ----------------------------------------------------------------
+def create_run(conn, category_id: int, model: str, provider: str,
+               phase: str = PHASE_INCLUSION, name: Optional[str] = None,
+               source_run_id: Optional[str] = None, prompt_spec: Optional[str] = None) -> str:
+    """`prompt_spec` is a JSON snapshot of the prompt inputs this run will use (template +
+    version + Include/Exclude context + hints), stamped so the run's prompts are exactly
+    reproducible later even if the active template or the shortlist definition changes."""
+    run_id = f"run_{int(time.time() * 1000):x}_{uuid.uuid4().hex[:6]}"
+    if not name:
+        # Sequential per day: "Run YY-MM-DD - N", N = the next new run (chain head) for today.
+        now = db.now_iso()
+        seq = conn.execute(
+            f"SELECT COUNT(*) AS c FROM evaluation_runs "
+            f"WHERE category_id = {_P} AND source_run_id IS NULL AND started_at LIKE {_P}",
+            (category_id, now[:10] + "%")).fetchone()["c"] + 1
+        name = f"Run {now[2:10]} - {seq}"
+    conn.execute(
+        f"INSERT INTO evaluation_runs (run_id, category_id, name, source_run_id, phase, model, provider, started_at, prompt_spec) "
+        f"VALUES ({_P},{_P},{_P},{_P},{_P},{_P},{_P},{_P},{_P})",
+        (run_id, category_id, name, source_run_id, phase, model, provider, db.now_iso(), prompt_spec))
+    conn.commit()
+    return run_id
+
+
+def reusable_fresh_run(conn, category_id: int) -> Optional[str]:
+    """An inclusion run for the category that was never started (run_status IS NULL and no
+    results), so a fresh save or New Run can reuse it instead of stacking another empty run.
+    Newest first, or None."""
+    row = conn.execute(
+        f"SELECT run_id FROM evaluation_runs r "
+        f"WHERE r.category_id = {_P} AND r.phase = {_P} AND r.source_run_id IS NULL "
+        f"AND r.run_status IS NULL "
+        f"AND NOT EXISTS (SELECT 1 FROM evaluation_results er WHERE er.run_id = r.run_id) "
+        f"ORDER BY r.started_at DESC LIMIT 1", (category_id, PHASE_INCLUSION)).fetchone()
+    return row["run_id"] if row else None
+
+
+def restamp_run(conn, run_id: str, model: str, provider: str, prompt_spec: Optional[str]) -> None:
+    """Update an unstarted run's model / provider / prompt snapshot to the current config —
+    used when reusing a fresh run for a new save, so it reflects the latest parameters."""
+    conn.execute(
+        f"UPDATE evaluation_runs SET model = {_P}, provider = {_P}, prompt_spec = {_P} "
+        f"WHERE run_id = {_P}", (model, provider, prompt_spec, run_id))
+    conn.commit()
+
+
+def norm_sampling(sampling) -> Dict:
+    """Validated sampling controls: temperature (float in [0, 1] or None = provider default),
+    thinking (a `thinking` request dict or None = not sent), effort (str or None)."""
+    s = sampling or {}
+    t = s.get("temperature")
+    if t is not None:
+        t = max(0.0, min(float(t), 1.0))
+    th = s.get("thinking")
+    th = dict(th) if isinstance(th, dict) else None
+    e = s.get("effort")
+    return {"temperature": t, "thinking": th, "effort": str(e) if e else None}
+
+
+# A run with no explicit concurrency now evaluates pages in parallel waves by default (was 1 =
+# sequential). Only affects NEW runs — existing runs stamp their own concurrency in prompt_spec.
+DEFAULT_CONCURRENCY = 10
+MAX_CONCURRENCY = 20
+
+
+def norm_trial(trial) -> dict:
+    """Clamp/validate the A/B trial knobs; sampling defaults reproduce today's behaviour (no
+    sampling controls sent — the provider's defaults apply). Concurrency defaults to
+    DEFAULT_CONCURRENCY (parallel) so a normal Active Run runs concurrently unless set to 1."""
+    t = trial or {}
+    return {
+        "prompt_variant": "cached" if str(t.get("prompt_variant") or "current").lower() == "cached" else "current",
+        "concurrency": max(1, min(int(t.get("concurrency") or DEFAULT_CONCURRENCY), MAX_CONCURRENCY)),
+        "caching": bool(t.get("caching")),
+        "sampling": norm_sampling(t.get("sampling")),
+    }
+
+
+def prompt_spec_json(conn, cid: int, phase: str, trial=None, *, scope: Optional[Dict] = None,
+                     bench: Optional[Dict] = None) -> str:
+    """A JSON snapshot of everything a run's prompts and requests depend on — stamped on the run
+    so they stay exactly reproducible. `trial` carries the A/B knobs (prompt_variant /
+    concurrency / caching / sampling); the 'cached' variant stamps the reordered template so the
+    run uses it end-to-end. `scope` = {"kind": "gold", "urls": [...], "sha": ...} fixes the page
+    list for a scoped run; `bench` tags a benchmark run (the app never auto-advances it)."""
+    from . import categories as cat   # local: categories has no dependency on this module
+    from . import llm, prompts
+    c = cat.get_category(conn, cid) or {}
+    pname = "exclusion" if phase == PHASE_EXCLUSION else "inclusion"
+    tr = norm_trial(trial)
+    if tr["prompt_variant"] == "cached":
+        template, template_version = cached_template(pname), "cached"
+    else:
+        template, template_version = prompts.default_text(pname), prompts.template_version()
+    spec = {
+        "template": template,
+        "template_version": template_version,
+        # Content fingerprint of the template text: same hash <=> same prompt. The git SHA above
+        # changes on ANY commit, so only this tells you whether the prompt itself changed.
+        "template_hash": template_fingerprint(template),
+        "inclusion_context": c.get("inclusion_context") or "",
+        "exclusion_context": c.get("exclusion_context") or "",
+        "name": (c.get("description") or "").strip() or cat.prettify(c.get("slug")) or "the topic",
+        "keep_hints": c.get("adjudication_hints_keep") or "",
+        "drop_hints": c.get("adjudication_hints_drop") or "",
+        "body_limit": BODY_CHAR_LIMIT,
+        "prompt_variant": tr["prompt_variant"],
+        "concurrency": tr["concurrency"],
+        "caching": tr["caching"],
+        # Request controls. null = not sent (provider defaults), which is the product behaviour.
+        "temperature": tr["sampling"]["temperature"],
+        "thinking": tr["sampling"]["thinking"],
+        "effort": tr["sampling"]["effort"],
+        "max_tokens": llm.eval_max_tokens(),
+        "sdk_version": llm.sdk_version(),
+    }
+    if scope:
+        spec["scope"] = scope
+    if bench:
+        spec["bench"] = bench
+    return json.dumps(spec, ensure_ascii=False)
+
+
+def run_trial(conn, run_id: str) -> dict:
+    """The A/B trial knobs stamped on a run (prompt_variant / concurrency / caching / sampling),
+    defaulted for legacy runs."""
+    spec = run_prompt_spec(conn, run_id) or {}
+    return norm_trial({"prompt_variant": spec.get("prompt_variant"),
+                       "concurrency": spec.get("concurrency"), "caching": spec.get("caching"),
+                       "sampling": {"temperature": spec.get("temperature"),
+                                    "thinking": spec.get("thinking"), "effort": spec.get("effort")}})
+
+
+def run_scope(conn, run_id: str) -> Optional[Dict]:
+    """The fixed url list a scoped (benchmark) run evaluates, or None for a normal run."""
+    spec = run_prompt_spec(conn, run_id) or {}
+    sc = spec.get("scope")
+    return sc if isinstance(sc, dict) and sc.get("urls") else None
+
+
+def run_prompt_spec(conn, run_id: str) -> Optional[Dict]:
+    """The stamped prompt spec for a run (the template + context it used), or None for a
+    legacy run that predates stamping."""
+    row = conn.execute(f"SELECT prompt_spec FROM evaluation_runs WHERE run_id = {_P}",
+                       (run_id,)).fetchone()
+    raw = dict(row).get("prompt_spec") if row else None
+    if not raw:
+        return None
+    try:
+        d = json.loads(raw)
+        return d if isinstance(d, dict) else None
+    except (ValueError, TypeError):
+        return None
+
+
+def rename_run(conn, run_id: str, name: str) -> None:
+    conn.execute(f"UPDATE evaluation_runs SET name = {_P} WHERE run_id = {_P}",
+                 (name.strip(), run_id))
+    conn.commit()
+
+
+def run_candidates(conn, run_id: str, category_id: int, limit: int, *,
+                   organisations: Sequence[str], document_types: Sequence[str] = (),
+                   keywords: Sequence[str] = (), match: str = "any",
+                   include_search_only: bool = True, min_es_score: float = 0.0) -> List[dict]:
+    """Next `limit` shortlisted pages not yet evaluated IN THIS RUN. The deterministic
+    shortlist is evaluated first; if there's room left, top up with the category's pinned
+    GOV.UK-Search-only pages that have since been fetched into the corpus (so search-only
+    coverage gaps are evaluated too). `min_es_score` drops GOV.UK-Search-only pages whose
+    relevance is below the floor (a page with no es_score is kept — the score is unknown,
+    not low)."""
+    select_expr = ("c.url AS url, c.title AS title, c.description AS description, "
+                   "c.search_text AS body, c.content_hash AS content_hash")
+    extra_where = (f"c.url NOT IN (SELECT url FROM evaluation_results WHERE run_id = {_P})")
+    sql, params = shortlist.build_query(
+        select_expr=select_expr, extra_where=extra_where, extra_params=[run_id],
+        organisations=organisations, document_types=document_types,
+        keywords=keywords, match=match, limit=limit)
+    rows = [dict(r) for r in conn.execute(sql, tuple(params)).fetchall()]
+    if not include_search_only or len(rows) >= limit:
+        return rows[:limit]
+    # Top up with pinned GOV.UK-Search-only pages that are now in the corpus (have a body)
+    # and not yet evaluated in this run — above the relevance floor.
+    floor_sql, floor_params = "", []
+    if min_es_score and min_es_score > 0:
+        floor_sql = f" AND (sp.es_score IS NULL OR sp.es_score >= {_P})"
+        floor_params = [min_es_score]
+    got = {r["url"] for r in rows}
+    top = conn.execute(
+        f"SELECT c.url AS url, c.title AS title, c.description AS description, c.search_text AS body, "
+        f"c.content_hash AS content_hash "
+        f"FROM category_search_pages sp JOIN content c ON c.url = sp.url "
+        f"WHERE sp.category_id = {_P} AND sp.source = 'search'{floor_sql} "
+        f"AND c.is_redirect = 0 AND c.content_hash IS NOT NULL "
+        f"AND c.url NOT IN (SELECT url FROM evaluation_results WHERE run_id = {_P}) "
+        f"ORDER BY c.url LIMIT {_P}",
+        tuple([category_id] + floor_params + [run_id, limit - len(rows)])).fetchall()
+    for r in top:
+        d = dict(r)
+        if d["url"] not in got:
+            rows.append(d)
+    return rows[:limit]
+
+
+def scoped_candidates(conn, run_id: str, urls: Sequence[str], limit: int) -> List[dict]:
+    """Next `limit` pages from a FIXED url list (a benchmark's gold set) not yet evaluated in
+    this run. Deliberately ignores the category's org / doc-type / keyword filters — the list
+    *is* the sample — but still skips redirects, unfetched and withdrawn pages. Ordered by url
+    so every repeat sees the same sequence."""
+    urls = sorted(set(urls))
+    if not urls or limit <= 0:
+        return []
+    out: List[dict] = []
+    for i in range(0, len(urls), 500):
+        chunk = urls[i:i + 500]
+        marks = ",".join([_P] * len(chunk))
+        rows = conn.execute(
+            f"SELECT c.url AS url, c.title AS title, c.description AS description, "
+            f"c.search_text AS body, c.content_hash AS content_hash "
+            f"FROM content c WHERE c.url IN ({marks}) "
+            f"AND c.is_redirect = 0 AND c.content_hash IS NOT NULL AND COALESCE(c.withdrawn, 0) = 0 "
+            f"AND c.url NOT IN (SELECT url FROM evaluation_results WHERE run_id = {_P}) "
+            f"ORDER BY c.url", tuple(chunk) + (run_id,)).fetchall()
+        out.extend(dict(r) for r in rows)
+        if len(out) >= limit:
+            break
+    return out[:limit]
+
+
+def save_page(conn, run_id: str, category_id: int, url: str,
+              decision: Optional[Dict], ms: int, raw_reply: Optional[str] = None,
+              content_hash: Optional[str] = None, stop_reason: Optional[str] = None) -> None:
+    """`content_hash` is the content.content_hash of the body that was evaluated, so a verdict
+    can be checked against the page version a gold label was made on."""
+    keep = decision.get("keep") if decision else None
+    score = decision.get("score") if decision else None
+    reason = decision.get("reason") if decision else "unparseable model reply"
+    # Keep the model's raw reply verbatim so an unparseable/odd decision can be debugged
+    # later (capped so a runaway reply can't bloat the row).
+    raw = (raw_reply or "")[:8000] or None
+    # Grounding fields from the inclusion template (None for exclusion-phase / legacy replies):
+    # primary_topic is passed to Phase 2 as {{PASS1_TOPIC}}; where_hit/evidence are JSON lists.
+    topic = decision.get("primary_topic") if decision else None
+    where_hit = decision.get("where_hit") if decision else None
+    evidence = decision.get("evidence") if decision else None
+    conn.execute(
+        f"INSERT INTO evaluation_results (run_id, category_id, url, keep, score, reason, raw_reply, ms, created_at, "
+        f"primary_topic, where_hit, evidence, content_hash, stop_reason) "
+        f"VALUES ({_P},{_P},{_P},{_P},{_P},{_P},{_P},{_P},{_P},{_P},{_P},{_P},{_P},{_P})",
+        (run_id, category_id, url, keep, score, reason, raw, ms, db.now_iso(), topic, where_hit, evidence,
+         content_hash, stop_reason))
+    # update run totals
+    kept = 1 if keep == 1 else 0
+    dropped = 1 if keep == 0 else 0
+    unpar = 1 if keep is None else 0
+    conn.execute(
+        f"UPDATE evaluation_runs SET pages = pages + 1, kept = kept + {_P}, "
+        f"dropped = dropped + {_P}, unparseable = unparseable + {_P}, total_ms = total_ms + {_P} "
+        f"WHERE run_id = {_P}", (kept, dropped, unpar, ms, run_id))
+    conn.commit()
+
+
+def set_actual_model(conn, run_id: str, actual_model: str) -> None:
+    """Record the model the API actually served (once), if we don't have it yet."""
+    if not actual_model:
+        return
+    conn.execute(
+        f"UPDATE evaluation_runs SET actual_model = {_P} "
+        f"WHERE run_id = {_P} AND (actual_model IS NULL OR actual_model = '')",
+        (actual_model, run_id))
+    conn.commit()
+
+
+def add_run_cost(conn, run_id: str, cost: float,
+                 in_tokens: Optional[int] = None, out_tokens: Optional[int] = None,
+                 hit_tokens: Optional[int] = None, miss_tokens: Optional[int] = None) -> None:
+    """Accumulate this call's cost and (optionally) its token counts, including the
+    cache hit/miss split of the input tokens."""
+    conn.execute(
+        f"UPDATE evaluation_runs SET cost = cost + {_P}, "
+        f"in_tokens = in_tokens + {_P}, out_tokens = out_tokens + {_P}, "
+        f"hit_tokens = hit_tokens + {_P}, miss_tokens = miss_tokens + {_P} WHERE run_id = {_P}",
+        (cost or 0.0, in_tokens or 0, out_tokens or 0, hit_tokens or 0, miss_tokens or 0, run_id))
+    conn.commit()
+
+
+def finish_run(conn, run_id: str) -> None:
+    conn.execute(
+        f"UPDATE evaluation_runs SET finished_at = {_P}, run_status = 'complete', pid = NULL, "
+        f"heartbeat_at = {_P}, stop_reason = NULL WHERE run_id = {_P}",
+        (db.now_iso(), db.now_iso(), run_id))
+    conn.commit()
+
+
+# ---- live run state (is a driver actively working this run?) --------------
+# A run record carries run_status ('running'|'stopped'|'complete'), the driver's pid + host,
+# and a heartbeat. The driver marks it running (updating the heartbeat) as it works, and marks
+# it stopped when it steps away without finishing. If a run is left 'running' but its process
+# is gone (crash, kill, restart), run_is_alive() reports it dead so the UI can offer to resume.
+def mark_run_running(conn, run_id: str, pid: Optional[int] = None) -> None:
+    conn.execute(
+        f"UPDATE evaluation_runs SET run_status = 'running', pid = {_P}, host = {_P}, "
+        f"heartbeat_at = {_P} WHERE run_id = {_P}",
+        (int(pid if pid is not None else os.getpid()), socket.gethostname(), db.now_iso(), run_id))
+    conn.commit()
+
+
+def mark_run_stopped(conn, run_id: str, reason: Optional[str] = None) -> None:
+    """Driver stepped away without finishing (budget/cap/error/stop). Leaves finished_at as-is.
+    `reason` (budget|provider_errors|config|manual|cap) is recorded in stop_reason; passing None
+    preserves any reason already stamped (COALESCE), so a later catch-all call can't erase it."""
+    conn.execute(
+        f"UPDATE evaluation_runs SET run_status = 'stopped', pid = NULL, heartbeat_at = {_P}, "
+        f"stop_reason = COALESCE({_P}, stop_reason) "
+        f"WHERE run_id = {_P} AND finished_at IS NULL", (db.now_iso(), reason, run_id))
+    conn.commit()
+
+
+def _heartbeat_age_seconds(ts: Optional[str]) -> Optional[float]:
+    if not ts:
+        return None
+    try:
+        dt = datetime.fromisoformat(str(ts).replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return (datetime.now(timezone.utc) - dt).total_seconds()
+    except (ValueError, TypeError):
+        return None
+
+
+def run_is_alive(run: dict, stale_after_s: int = 300) -> bool:
+    """True if a driver is actually working this run right now. On the same host we trust the
+    pid (os.kill(pid, 0)); off-host (or no pid) we fall back to a fresh heartbeat."""
+    if not run or run.get("run_status") != "running":
+        return False
+    pid, host = run.get("pid"), run.get("host")
+    if pid and host and host == socket.gethostname():
+        try:
+            os.kill(int(pid), 0)
+            return True
+        except (OSError, ValueError, TypeError):
+            return False
+    age = _heartbeat_age_seconds(run.get("heartbeat_at"))
+    return age is not None and age < stale_after_s
+
+
+def run_is_stalled(run: dict) -> bool:
+    """An unfinished run that is marked running but whose driver is gone — safe to resume."""
+    if not run or run.get("finished_at"):
+        return False
+    return run.get("run_status") == "running" and not run_is_alive(run)
+
+
+def get_run(conn, run_id: str) -> Optional[dict]:
+    row = conn.execute(f"SELECT * FROM evaluation_runs WHERE run_id = {_P}", (run_id,)).fetchone()
+    return dict(row) if row else None
+
+
+def delete_run(conn, run_id: str) -> None:
+    """Delete a run and its per-page results. Does NOT touch the ai_usage spend ledger,
+    so the daily budget accounting is preserved."""
+    conn.execute(f"DELETE FROM evaluation_results WHERE run_id = {_P}", (run_id,))
+    conn.execute(f"DELETE FROM evaluation_runs WHERE run_id = {_P}", (run_id,))
+    conn.commit()
+
+
+def list_runs_query(category_id: int):
+    """(sql, params) for a category's runs list — so the page can show the SQL it ran."""
+    return (f"SELECT * FROM evaluation_runs WHERE category_id = {_P} ORDER BY started_at DESC",
+            [category_id])
+
+
+def list_runs(conn, category_id: int) -> List[dict]:
+    sql, params = list_runs_query(category_id)
+    rows = [dict(r) for r in conn.execute(sql, tuple(params)).fetchall()]
+    for d in rows:
+        spec = d.pop("prompt_spec", None)   # keep the list light; expose only the A/B trial knobs
+        d["trial"] = None
+        if spec:
+            try:
+                s = json.loads(spec)
+                d["trial"] = {"variant": s.get("prompt_variant") or "current",
+                              "concurrency": int(s.get("concurrency") or 1),
+                              "caching": bool(s.get("caching")),
+                              "template_version": s.get("template_version"),
+                              # Prompt identity: the stamped fingerprint, or one computed from the
+                              # stored template for runs stamped before the field existed.
+                              "template_hash": s.get("template_hash") or template_fingerprint(s.get("template")),
+                              "body_limit": s.get("body_limit"),
+                              # Request controls (null = provider default) + benchmark scope.
+                              "temperature": s.get("temperature"),
+                              "thinking": s.get("thinking"),
+                              "effort": s.get("effort"),
+                              "max_tokens": s.get("max_tokens"),
+                              "scope_kind": (s.get("scope") or {}).get("kind") if isinstance(s.get("scope"), dict) else None,
+                              "scope_n": len((s.get("scope") or {}).get("urls") or []) if isinstance(s.get("scope"), dict) else None,
+                              "bench": bool(s.get("bench"))}
+            except (ValueError, TypeError):
+                pass
+    return rows
+
+
+# How a scoped run's prompt_spec JSON reads (json.dumps default separators), for SQL LIKE.
+SCOPE_MARKER = '%"scope": {%'
+
+
+def reconcile_to_shortlist(conn, category_id: int) -> dict:
+    """Keep a category's LLM evaluation results aligned with its (freshly recomputed)
+    shortlist membership after a definition change:
+
+      * retain results for pages still in the shortlist (matched by content_id, so a page
+        reached via a different url alias still counts),
+      * drop results for pages the new filters removed,
+      * new pages just aren't evaluated yet (the next run picks them up).
+
+    Then recompute each run's pages/kept/dropped so the displayed counts stay honest
+    (spend/token counters are left untouched — that cost was really incurred).
+    Assumes category_shortlist_pages has already been refreshed. Best-effort."""
+    # Retain results for pages still forwarded to the AI: the keyword shortlist OR the category's
+    # GOV.UK-Search-only pool (source='search' — those pages are never in category_shortlist_pages,
+    # so without this clause every save erased their results). Scoped (benchmark) runs evaluate a
+    # fixed url list that the shortlist definition doesn't govern, so they are left alone.
+    conn.execute(
+        f"DELETE FROM evaluation_results "
+        f"WHERE run_id IN (SELECT run_id FROM evaluation_runs WHERE category_id = {_P} "
+        f"                 AND COALESCE(prompt_spec, '') NOT LIKE {_P}) "
+        f"AND NOT EXISTS ("
+        f"  SELECT 1 FROM content c "
+        f"  JOIN category_shortlist_pages m ON m.content_id = COALESCE(c.content_id, c.url) "
+        f"  WHERE c.url = evaluation_results.url AND m.category_id = {_P}) "
+        f"AND NOT EXISTS ("
+        f"  SELECT 1 FROM category_search_pages sp "
+        f"  WHERE sp.url = evaluation_results.url AND sp.category_id = {_P} AND sp.source = 'search')",
+        (category_id, SCOPE_MARKER, category_id, category_id))
+    conn.execute(
+        f"UPDATE evaluation_runs SET "
+        f"pages = (SELECT COUNT(*) FROM evaluation_results r WHERE r.run_id = evaluation_runs.run_id), "
+        f"kept = (SELECT COUNT(*) FROM evaluation_results r WHERE r.run_id = evaluation_runs.run_id AND r.keep = 1), "
+        f"dropped = (SELECT COUNT(*) FROM evaluation_results r WHERE r.run_id = evaluation_runs.run_id AND r.keep = 0) "
+        f"WHERE category_id = {_P}",
+        (category_id,))
+    conn.commit()
+    return {"ok": True}
+
+
+def run_chain(conn, run_id: str) -> List[dict]:
+    """The inclusion → exclusion (→ …) chain of runs this run belongs to, ordered
+    oldest-first (so the inclusion phase comes first). Runs are linked by
+    source_run_id; an evaluation's phases share one lineage."""
+    start = get_run(conn, run_id)
+    if not start:
+        return []
+    root = start
+    for _ in range(20):                      # walk up to the lineage root
+        parent_id = root.get("source_run_id")
+        if not parent_id:
+            break
+        parent = get_run(conn, parent_id)
+        if not parent:
+            break
+        root = parent
+    chain = [root]
+    ids = {root["run_id"]}
+    pool = list_runs(conn, root["category_id"])
+    added = True
+    while added:                             # walk down, collecting descendants
+        added = False
+        for r in pool:
+            if r["run_id"] not in ids and r.get("source_run_id") in ids:
+                chain.append(r)
+                ids.add(r["run_id"])
+                added = True
+    chain.sort(key=lambda r: (r.get("started_at") or ""))
+    return chain
+
+
+def unparsed_results(conn, run_ids: Sequence[str]) -> List[dict]:
+    """The pages whose model reply could not be parsed (keep IS NULL) across the given
+    runs — i.e. the items counted as 'unparseable'. Returns [{run_id, url, reason}]."""
+    ids = list(run_ids)
+    if not ids:
+        return []
+    ph = ",".join([_P] * len(ids))
+    rows = conn.execute(
+        f"SELECT run_id, url, reason, raw_reply FROM evaluation_results "
+        f"WHERE keep IS NULL AND run_id IN ({ph}) ORDER BY url", tuple(ids)).fetchall()
+    return [dict(r) for r in rows]
+
+
+# Provider finish reasons that mean the reply was cut off before it was complete.
+_TRUNCATED_STOP = ("max_tokens", "length")
+
+
+def truncated_results(conn, run_ids: Sequence[str]) -> List[dict]:
+    """Pages whose model reply was cut off at the token limit (stop_reason max_tokens/length)
+    across the given runs — a distinct failure from 'unparseable' (though a cut-off reply is
+    often also unparseable). Returns [{run_id, url, keep, stop_reason}]."""
+    ids = list(run_ids)
+    if not ids:
+        return []
+    ph = ",".join([_P] * len(ids))
+    sp = ",".join([_P] * len(_TRUNCATED_STOP))
+    rows = conn.execute(
+        f"SELECT run_id, url, keep, stop_reason FROM evaluation_results "
+        f"WHERE stop_reason IN ({sp}) AND run_id IN ({ph}) ORDER BY url",
+        tuple(_TRUNCATED_STOP) + tuple(ids)).fetchall()
+    return [dict(r) for r in rows]
+
+
+CREDIT_BALANCE_HINT = "Check your Anthropic Credit Balance."
+
+
+def credit_balance_hint(error_text: Optional[str]) -> Optional[str]:
+    """When a provider error mentions 'balance' (e.g. Anthropic's 'Your credit balance is too
+    low to access the Anthropic API'), the user-facing hint to check their credit balance;
+    otherwise None. Case-insensitive substring match."""
+    return CREDIT_BALANCE_HINT if error_text and "balance" in str(error_text).lower() else None
+
+
+def augment_error(error_text: Optional[str]) -> Optional[str]:
+    """Append the credit-balance hint to a provider error that looks like a low-balance error
+    (idempotent — never doubles the hint). Leaves other errors unchanged."""
+    hint = credit_balance_hint(error_text)
+    if hint and hint not in (error_text or ""):
+        return (error_text or "").rstrip() + " " + hint
+    return error_text
+
+
+# A run's persisted stop_reason → the plain-English 'why it didn't finish' shown on guc-0006.
+_STOP_REASON_WHY = {
+    "budget": "Stopped early because the daily AI budget was reached. Re-execute to continue where it left off.",
+    "provider_errors": "Stopped after repeated provider errors in a row — the provider was likely down or "
+                       "rate-limiting. Re-execute to resume where it left off.",
+    "balance": "Stopped — the provider rejected the calls for a low credit balance. "
+               + CREDIT_BALANCE_HINT + " Top up, then re-execute to resume where it left off.",
+    "config": "Stopped because of a configuration problem — e.g. no API key set for this run's provider. "
+              "Fix it in Settings, then re-execute.",
+    "manual": "Stopped manually (you pressed Stop). Re-execute to continue where it left off.",
+    "error": "Stopped after an unexpected error. Re-execute to continue where it left off.",
+}
+# Stop reasons that signal a real failure (red) vs benign pacing/manual (amber).
+_STOP_REASON_BAD = {"provider_errors", "balance", "config", "error"}
+
+
+def run_outcome(run_state: str, run_status: Optional[str], stop_reason: Optional[str],
+                continue_reason: Optional[str], unparsed_count: int, truncated_count: int) -> Dict:
+    """One-glance summary of a run's outcome for the Run details page (guc-0006): a status
+    `label` + `kind` ('good' | 'warn' | 'bad' | 'muted'), a plain-English `why` it didn't finish
+    (None when it did or never started), and the two page-level failure counts. Pure/testable.
+
+    `stop_reason` is the run's persisted code (budget|provider_errors|config|manual|cap|error);
+    when present it gives the exact cause. Older runs recorded no code, so `why` falls back to
+    naming the possibilities or the continue_reason (pages remaining / pending exclusion).
+    """
+    if run_state == "complete":
+        return {"label": "Completed", "kind": "good", "why": None,
+                "unparsed": int(unparsed_count or 0), "truncated": int(truncated_count or 0),
+                "stop_reason": None}
+    if run_state == "fresh":
+        return {"label": "Not started", "kind": "muted", "why": None,
+                "unparsed": int(unparsed_count or 0), "truncated": int(truncated_count or 0),
+                "stop_reason": None}
+    # partial — started but work remains
+    kind = "bad" if stop_reason in _STOP_REASON_BAD else "warn"
+    if stop_reason == "cap":
+        lead = (continue_reason + " ") if continue_reason else ""
+        why = lead + "It reached this execution's page cap — re-execute to evaluate the rest."
+    elif stop_reason in _STOP_REASON_WHY:
+        why = _STOP_REASON_WHY[stop_reason]
+    elif run_status == "stopped":
+        why = ("Stopped early — the daily AI budget was reached, a provider error occurred, or it "
+               "was stopped manually. Re-execute to continue where it left off.")
+    else:
+        lead = (continue_reason + " ") if continue_reason else "Some pages were not evaluated. "
+        why = lead + "Re-execute to evaluate the rest."
+    return {"label": "Did not complete", "kind": kind, "why": why,
+            "unparsed": int(unparsed_count or 0), "truncated": int(truncated_count or 0),
+            "stop_reason": stop_reason}
+
+
+def continuable_reason(chain: List[dict], shortlist_total: Optional[int] = None) -> Optional[str]:
+    """If the evaluation still has work to do — a phase in progress, a phase that
+    stopped below its input (input ≠ kept + dropped because pages remain), or a
+    pending exclusion — return a short reason. Otherwise None (nothing to continue).
+
+    'input' is the shortlist total for inclusion, and the previous phase's keeps for
+    exclusion. Pure/testable; the web layer supplies shortlist_total.
+    """
+    by_id = {r["run_id"]: r for r in chain}
+    have_excl = any("exclusion" in (r.get("phase") or "").lower() for r in chain)
+
+    for r in chain:                                  # a phase still running
+        if not r.get("finished_at"):
+            return f"{r.get('phase') or 'A phase'} is still in progress."
+    for r in chain:                                  # a finished phase that stopped short
+        if "exclusion" in (r.get("phase") or "").lower():
+            src = by_id.get(r.get("source_run_id"))
+            target = src.get("kept") if src else None
+        else:
+            target = shortlist_total
+        pages = r.get("pages") or 0
+        if target is not None and pages < target:
+            return (f"{r.get('phase')} evaluated {pages:,} of {target:,} — "
+                    f"{target - pages:,} still to do (input ≠ kept + dropped).")
+    incl = next((r for r in chain if "inclusion" in (r.get("phase") or "").lower()), None)
+    if incl and incl.get("finished_at") and (incl.get("kept") or 0) > 0 and not have_excl:
+        return f"Phase 2 (Exclusion) hasn't run over the {incl['kept']:,} kept pages."
+    return None
+
+
+def run_commentary(chain: List[dict], shortlist_total: Optional[int] = None,
+                   opened_run_id: Optional[str] = None) -> Dict[str, list]:
+    """Plain-English notes about a run's phase chain (oldest-first), grouped into:
+      phases    — what has run (and what's pending),
+      errors    — unparseable replies / unfinished phases,
+      reconcile — whether each phase's input equals kept + dropped (+ unparseable),
+      next_steps — what to do next (complete the run, run exclusion, unparseable, …).
+
+    Pure/deterministic so it's unit-testable; the web layer supplies shortlist_total
+    (the inclusion phase's input), which run was opened, and renders the result.
+    """
+    by_id = {r["run_id"]: r for r in chain}
+    phases: list = []
+    errors: list = []
+    reconcile: list = []
+    have_excl = any("exclusion" in (r.get("phase") or "").lower() for r in chain)
+
+    for r in chain:
+        phase = r.get("phase") or "Phase"
+        pages = r.get("pages") or 0
+        kept = r.get("kept") or 0
+        dropped = r.get("dropped") or 0
+        unpar = r.get("unparseable") or 0
+        finished = bool(r.get("finished_at"))
+        is_excl = "exclusion" in phase.lower()
+        if is_excl:
+            src = by_id.get(r.get("source_run_id"))
+            inp = (src.get("kept") if src else None)
+            inp_desc = (f"{inp:,} kept by the previous phase" if inp is not None
+                        else "the previous phase's keeps")
+        else:
+            inp = shortlist_total
+            inp_desc = f"{inp:,} shortlist pages" if inp is not None else "the shortlist"
+
+        # (a) what ran
+        phases.append({"kind": "ok" if finished else "info",
+                       "text": f"{phase}: {'complete' if finished else 'in progress'} — "
+                               f"{pages:,} evaluated ({kept:,} kept, {dropped:,} dropped"
+                               + (f", {unpar:,} unparseable" if unpar else "") + ")."})
+        # (b) errors
+        if unpar:
+            errors.append({"kind": "warn",
+                           "text": f"{phase}: {unpar:,} model repl{'y' if unpar == 1 else 'ies'} could not be "
+                                   "parsed (counted as errors — neither kept nor dropped)."})
+        if not finished:
+            errors.append({"kind": "warn", "text": f"{phase} has not finished — its totals are partial."})
+
+        # (c) reconciliation: input == kept + dropped (+ unparseable)
+        if inp is None:
+            continue
+        settled = kept + dropped + unpar
+        if pages == inp and settled == pages and unpar == 0:
+            reconcile.append({"kind": "ok",
+                              "text": f"{phase}: input {inp:,} = kept {kept:,} + dropped {dropped:,}. ✓"})
+        else:
+            bits = []
+            if pages < inp:
+                bits.append(f"{inp - pages:,} of the {inp_desc} not evaluated yet")
+            elif pages > inp:
+                bits.append(f"evaluated {pages:,}, more than the {inp:,} input")
+            if unpar:
+                bits.append(f"{unpar:,} unparseable, so kept + dropped is short by {unpar:,}")
+            if settled != pages:
+                bits.append(f"kept + dropped{' + unparseable' if unpar else ''} ({settled:,}) ≠ pages ({pages:,})")
+            reconcile.append({"kind": "warn",
+                              "text": f"{phase}: input {inp:,} vs {kept:,} kept + {dropped:,} dropped"
+                                      + (f" + {unpar:,} unparseable" if unpar else "")
+                                      + " — " + "; ".join(bits) + "."})
+
+    # Pending exclusion phase
+    if not have_excl:
+        incl = next((r for r in chain if "inclusion" in (r.get("phase") or "").lower()), None)
+        if incl:
+            ik = incl.get("kept") or 0
+            if incl.get("finished_at") and ik > 0:
+                phases.append({"kind": "info",
+                               "text": f"Phase 2 – Exclusion: not run yet — {ik:,} kept pages are waiting to "
+                                       "be re-checked."})
+            elif not incl.get("finished_at"):
+                phases.append({"kind": "info",
+                               "text": "Phase 2 – Exclusion: starts automatically once inclusion finishes "
+                                       "(if any pages are kept)."})
+
+    # ---- what to do next -------------------------------------------------
+    next_steps: list = []
+    opened = by_id.get(opened_run_id)
+    total_unpar = sum((r.get("unparseable") or 0) for r in chain)
+    incl = next((r for r in chain if "inclusion" in (r.get("phase") or "").lower()), None)
+
+    if opened is not None and not opened.get("finished_at"):
+        p = opened.get("pages") or 0
+        if "exclusion" in (opened.get("phase") or "").lower():
+            src = by_id.get(opened.get("source_run_id"))
+            tgt = src.get("kept") if src else None
+        else:
+            tgt = shortlist_total
+        rem = (tgt - p) if (tgt is not None and tgt > p) else None
+        next_steps.append({"kind": "info",
+                           "text": "Complete this run"
+                                   + (f" — {rem:,} of {tgt:,} pages still to evaluate" if rem else "")
+                                   + ". Use “Complete this run” above to finish it in the background."})
+    if incl and incl.get("finished_at") and (incl.get("kept") or 0) > 0 and not have_excl:
+        next_steps.append({"kind": "info",
+                           "text": f"Run Phase 2 (Exclusion) over the {incl['kept']:,} kept pages — open the "
+                                   "category’s Preview → Semantic Match and Evaluate (it also auto-starts when "
+                                   "inclusion completes)."})
+    if total_unpar > 0:
+        next_steps.append({"kind": "warn",
+                           "text": f"{total_unpar:,} page(s) could not be parsed and were left unscored — see "
+                                   "“Not parsed” below. They aren’t retried automatically; re-evaluate them by "
+                                   "re-running (e.g. a fresh run, or a different model) to score them."})
+    if not next_steps:
+        next_steps.append({"kind": "ok", "text": "Nothing to do — this evaluation looks complete."})
+
+    return {"phases": phases, "errors": errors, "reconcile": reconcile, "next_steps": next_steps}
+
+
+def compare(conn, base_run: str, other_run: str) -> Dict[str, int]:
+    """Compare `other_run` to `base_run` over pages evaluated in BOTH: how many the
+    other run kept/dropped, and how many decisions disagree with the base run."""
+    sql = (
+        "SELECT COUNT(*) AS shared, "
+        "SUM(CASE WHEN o.keep = 1 THEN 1 ELSE 0 END) AS kept, "
+        "SUM(CASE WHEN o.keep = 0 THEN 1 ELSE 0 END) AS dropped, "
+        "SUM(CASE WHEN o.keep = b.keep THEN 0 "
+        "         WHEN o.keep IS NULL AND b.keep IS NULL THEN 0 ELSE 1 END) AS disagree "
+        "FROM evaluation_results b JOIN evaluation_results o ON o.url = b.url "
+        f"WHERE b.run_id = {_P} AND o.run_id = {_P}")
+    row = conn.execute(sql, (base_run, other_run)).fetchone()
+    return {"shared": row["shared"] or 0, "kept": row["kept"] or 0,
+            "dropped": row["dropped"] or 0, "disagree": row["disagree"] or 0}
+
+
+def run_disagreements(conn, base_run: str, other_run: str) -> List[dict]:
+    """Over pages evaluated in BOTH runs, the rows where the keep/drop decision differs —
+    the per-page detail behind compare()'s `disagree` count. Returns each URL with both runs'
+    keep, reason and raw_reply so the difference can be shown (and explained) side by side."""
+    sql = (
+        "SELECT b.url AS url, b.keep AS base_keep, b.score AS base_score, "
+        "b.reason AS base_reason, b.raw_reply AS base_raw, "
+        "o.keep AS other_keep, o.score AS other_score, "
+        "o.reason AS other_reason, o.raw_reply AS other_raw "
+        "FROM evaluation_results b JOIN evaluation_results o ON o.url = b.url "
+        f"WHERE b.run_id = {_P} AND o.run_id = {_P} AND "
+        "(CASE WHEN b.keep = o.keep THEN 0 "
+        "      WHEN b.keep IS NULL AND o.keep IS NULL THEN 0 ELSE 1 END) = 1 "
+        "ORDER BY b.url")
+    return [dict(r) for r in conn.execute(sql, (base_run, other_run)).fetchall()]
+
+
+def _final_keep_map(conn, incl_run_id: str, excl_run_id: Optional[str]) -> dict:
+    """{url: bool} — a run-chain's FINAL shortlist outcome per page it evaluated.
+    Final keep = inclusion kept AND (no exclusion phase, or exclusion also kept). A page the
+    exclusion pass didn't re-score is treated as kept (exclusion only removes)."""
+    out = {r["url"]: (r["keep"] == 1)
+           for r in conn.execute(f"SELECT url, keep FROM evaluation_results WHERE run_id = {_P}",
+                                 (incl_run_id,)).fetchall()}
+    if excl_run_id:
+        excl = {r["url"]: (r["keep"] == 1)
+                for r in conn.execute(f"SELECT url, keep FROM evaluation_results WHERE run_id = {_P}",
+                                      (excl_run_id,)).fetchall()}
+        for url, inc_keep in list(out.items()):
+            out[url] = bool(inc_keep and excl.get(url, True))
+    return out
+
+
+def final_outcome_diffs(conn, base_incl_id: Optional[str], base_excl_id: Optional[str],
+                        other_incl_id: Optional[str], other_excl_id: Optional[str]) -> List[dict]:
+    """Pages that end with a DIFFERENT final shortlist result between the two run-chains — in one
+    chain's final shortlist but not the other's — over pages BOTH chains evaluated. Returns
+    [{url, base_final, other_final}] where the finals are booleans (in the final shortlist)."""
+    if not (base_incl_id and other_incl_id):
+        return []
+    b = _final_keep_map(conn, base_incl_id, base_excl_id)
+    o = _final_keep_map(conn, other_incl_id, other_excl_id)
+    return [{"url": url, "base_final": b[url], "other_final": o[url]}
+            for url in sorted(set(b) & set(o)) if b[url] != o[url]]
+
+
+def run_results_query(run_id: str, keep: Optional[int] = None, limit: Optional[int] = None,
+                      source_run_id: Optional[str] = None):
+    """(sql, params) for a run's per-page results — so the page can show the SQL it ran. When
+    `source_run_id` is given (an exclusion run's inclusion run), also return that run's reason
+    for the same page as `src_reason`, so the inclusion and exclusion reasons can be shown side
+    by side."""
+    if source_run_id:
+        p = "r."
+        sql = (f"SELECT r.url AS url, r.keep AS keep, r.score AS score, r.reason AS reason, "
+               f"s.reason AS src_reason, "
+               # The grounding fields are written by the inclusion pass only, so on an exclusion
+               # run they live on the joined inclusion row `s`; COALESCE covers both run types.
+               f"COALESCE(r.primary_topic, s.primary_topic) AS primary_topic, "
+               f"COALESCE(r.where_hit, s.where_hit) AS where_hit, "
+               f"COALESCE(r.evidence, s.evidence) AS evidence "
+               f"FROM evaluation_results r "
+               f"LEFT JOIN evaluation_results s ON s.run_id = {_P} AND s.url = r.url "
+               f"WHERE r.run_id = {_P}")
+        params: list = [source_run_id, run_id]
+    else:
+        p = ""
+        sql = (f"SELECT url, keep, score, reason, NULL AS src_reason, primary_topic, where_hit, evidence "
+               f"FROM evaluation_results WHERE run_id = {_P}")
+        params = [run_id]
+    if keep is not None:
+        sql += f" AND {p}keep = {_P}"
+        params.append(keep)
+    sql += (f" ORDER BY {p}score DESC NULLS LAST, {p}url" if _IS_PG
+            else f" ORDER BY {p}score DESC, {p}url")
+    if limit:
+        sql += f" LIMIT {int(limit)}"
+    return sql, params
+
+
+def run_results(conn, run_id: str, keep: Optional[int] = None,
+                limit: Optional[int] = None, source_run_id: Optional[str] = None) -> List[dict]:
+    sql, params = run_results_query(run_id, keep=keep, limit=limit, source_run_id=source_run_id)
+    return [dict(r) for r in conn.execute(sql, tuple(params)).fetchall()]

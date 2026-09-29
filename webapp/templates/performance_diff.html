@@ -1,0 +1,352 @@
+{% extends "base.html" %}
+{% from "_crumbs.html" import crumbs %}
+{% block page_id %}guc-0028{% endblock %}
+{% block title %}{{ category.display_name }} — why runs differ{% endblock %}
+{% block content %}
+
+  {% macro chip(k) %}
+    {%- if k == 1 -%}<span class="kd keep">KEEP</span>
+    {%- elif k == 0 -%}<span class="kd drop">DROP</span>
+    {%- else -%}<span class="kd none">—</span>{%- endif -%}
+  {% endmacro %}
+
+  {% macro dec(cell) %}
+    {%- if cell -%}{{ chip(cell.keep) }}
+      {%- if cell.score is not none %}<span class="score" title="Model confidence score">{{ '%.2f'|format(cell.score|float) }}</span>{% endif -%}
+    {%- else -%}{{ chip(None) }}{%- endif -%}
+  {% endmacro %}
+
+  {# The grounding data the model returned for a cell: primary topic, fields hit, verbatim quotes. #}
+  {% macro evidence(cell) %}
+    {%- if cell and (cell.evidence or cell.topic) -%}
+      <div class="ev">
+        {% if cell.topic %}<div class="ev-topic">Topic: <strong>{{ cell.topic }}</strong>{% if cell.where_hit %} · found in {{ cell.where_hit|join(', ') }}{% endif %}</div>{% endif %}
+        {% if cell.evidence %}<ul class="ev-quotes">{% for q in cell.evidence %}<li>“{{ q }}”</li>{% endfor %}</ul>{% endif %}
+      </div>
+    {%- endif -%}
+  {% endmacro %}
+
+  {% macro reason(cell, phase, has_excl) %}
+    {%- if cell and cell.reason -%}<div class="rsn">{{ cell.reason }}</div>{{ evidence(cell) }}
+    {%- elif cell -%}<span class="muted-sm">(no reason recorded)</span>{{ evidence(cell) }}
+    {%- elif phase == 'inclusion' -%}<span class="muted-sm">not scored in this run</span>
+    {%- elif not has_excl -%}<span class="muted-sm">no Exclusion Phase in this run</span>
+    {%- else -%}<span class="muted-sm">not reached — dropped at inclusion</span>{%- endif -%}
+  {% endmacro %}
+
+  {% macro card(c, base_has_excl, other_has_excl) %}
+    <div class="diff-card card" data-url="{{ c.url }}" data-phase="{{ c.phase }}">
+      <div class="dc-head">
+        <a class="dc-url" href="{{ c.url }}" target="_blank" rel="noopener" title="{{ c.url }}">{{ c.title or c.url }}</a>
+        <span class="dc-phase {{ c.phase }}">diverged at {{ 'Inclusion' if c.phase == 'inclusion' else 'Exclusion' }}</span>
+        {% if c.keywords %}<span class="dc-kw">{% for k in c.keywords %}<span class="kw-pill">{{ k }}</span>{% endfor %}</span>{% endif %}
+      </div>
+      <div class="table-wrap">
+        <table class="dc-table">
+          <thead>
+            <tr>
+              <th></th><th>Inclusion decision</th><th class="rsn-col">Inclusion reason</th>
+              <th>Exclusion decision</th><th class="rsn-col">Exclusion reason</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <th class="rowlab">Run 1<br><span class="muted-sm">baseline</span></th>
+              <td class="{{ 'hot' if c.phase == 'inclusion' }}">{{ dec(c.b_incl) }}</td>
+              <td class="rsn-col {{ 'hot' if c.phase == 'inclusion' }}">{{ reason(c.b_incl, 'inclusion', base_has_excl) }}</td>
+              <td class="{{ 'hot' if c.phase == 'exclusion' }}">{{ dec(c.b_excl) }}</td>
+              <td class="rsn-col {{ 'hot' if c.phase == 'exclusion' }}">{{ reason(c.b_excl, 'exclusion', base_has_excl) }}</td>
+            </tr>
+            <tr>
+              <th class="rowlab">Run 2</th>
+              <td class="{{ 'hot' if c.phase == 'inclusion' }}">{{ dec(c.o_incl) }}</td>
+              <td class="rsn-col {{ 'hot' if c.phase == 'inclusion' }}">{{ reason(c.o_incl, 'inclusion', other_has_excl) }}</td>
+              <td class="{{ 'hot' if c.phase == 'exclusion' }}">{{ dec(c.o_excl) }}</td>
+              <td class="rsn-col {{ 'hot' if c.phase == 'exclusion' }}">{{ reason(c.o_excl, 'exclusion', other_has_excl) }}</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="adjud" data-choice="{{ c.choice or '' }}">
+        <span class="adjud-q">Which is right?</span>
+        <div class="adjud-opts">
+          <button type="button" class="adjud-btn" data-choice="run1">Run 1</button>
+          <button type="button" class="adjud-btn" data-choice="run2">Run 2</button>
+          <button type="button" class="adjud-btn" data-choice="neither">Neither</button>
+        </div>
+      </div>
+      <div class="verdict" data-has="{{ '1' if c.verdict else '0' }}">
+        {% if c.verdict %}<div class="v-body">{{ c.verdict }}</div>
+        {% else %}<button class="btn secondary-btn v-btn" type="button">Why did they differ?</button>
+          <span class="v-note">LLM verdict · {{ judge_label }}</span>{% endif %}
+      </div>
+    </div>
+  {% endmacro %}
+
+  {{ crumbs([
+      ("Shortlists", url_for('list_categories_page')),
+      (category.display_name, url_for('shortlist_page', cid=category.id)),
+      ("Run performance", url_for('performance_page', cid=category.id)),
+      ("Run diff", none)]) }}
+  <h1 style="margin:16px 0 6px;">Why did the runs differ?</h1>
+  {% if is_admin %}<p class="hint" style="margin:0 0 4px;">Want ground truth rather than a run-vs-run verdict? Rate one run's
+    outcomes page by page on the <a href="{{ url_for('gold_page', cid=category.id) }}{% if other_head %}?run={{ other_head }}{% elif base_head %}?run={{ base_head }}{% endif %}">Gold labels</a> page — each “correct / wrong” becomes a gold label.</p>{% endif %}
+  <p class="hint" style="margin-top:0;">Every page below was scored by <strong>both</strong> runs but got a
+    <strong>different</strong> keep/drop verdict — the detail behind “Decisions disagree with Run 1”, split by phase.
+    Reasons are what each run recorded at the time; the <em>Why did they differ?</em> verdict is generated on demand by the
+    same model Run 2 used, and cached.</p>
+
+  {% if not (base_incl and other_incl) %}
+    <div class="card"><p>Pick two runs on the <a href="{{ url_for('performance_page', cid=category.id) }}">Run performance</a>
+      page, then click a “Decisions disagree with Run 1” figure to open this view.</p></div>
+  {% else %}
+  {% macro cfg_lines(c) %}
+    <div class="rc-meta mono">Inclusion: {{ (c.inclusion.model if c.inclusion else none) or '—' }}{% if c.inclusion and c.inclusion.template_version %} · prompt v{{ c.inclusion.template_version }}{% endif %}</div>
+    <div class="rc-meta mono">Exclusion: {% if c.exclusion %}{{ c.exclusion.model or '—' }}{% if c.exclusion.template_version %} · prompt v{{ c.exclusion.template_version }}{% endif %}{% else %}none in this run{% endif %}</div>
+  {% endmacro %}
+  <div class="runs-strip">
+    <div class="run-col">
+      <div class="rc-tag">Run 1 · baseline</div>
+      <div class="rc-name">{{ base_incl.name or '—' }}</div>
+      <div class="rc-meta">{{ (base_incl.started_at or '')[:19].replace('T',' ') }}</div>
+      {{ cfg_lines(chip_base) }}
+    </div>
+    <div class="run-col">
+      <div class="rc-tag alt">Run 2</div>
+      <div class="rc-name">{{ other_incl.name or '—' }}</div>
+      <div class="rc-meta">{{ (other_incl.started_at or '')[:19].replace('T',' ') }}</div>
+      {{ cfg_lines(chip_other) }}
+      {% if prompt_diffs %}<div class="rc-meta" style="color:#d4351c;font-weight:600;">⚠ Different prompt from Run 1 ({{ prompt_diffs|join(', ') }})</div>
+      {% else %}<div class="rc-meta" style="color:var(--green-dark);">Same prompts as Run 1</div>{% endif %}
+    </div>
+  </div>
+
+  {# How many pages end with a DIFFERENT final shortlist result between the two runs, with a
+     click-to-list of exactly which pages and each run's final IN/OUT. #}
+  <details class="final-diff card" id="final-diffs"{% if final_diffs %} open{% endif %}>
+    <summary><strong>{{ final_diffs|length }}</strong> page{{ '' if final_diffs|length == 1 else 's' }}
+      end with a <strong>different final shortlist result</strong> between the two runs
+      {% if final_band %}<span class="muted-sm">in the <strong>{{ final_band }}</strong> band
+        (of {{ final_total }} total) · <a href="?base={{ base_head|urlencode }}&amp;other={{ other_head|urlencode }}#final-diffs">show all</a></span>
+      {% elif final_diffs %}<span class="muted-sm">— list</span>{% endif %}</summary>
+    {% if final_diffs %}
+    <table class="dc-table" style="margin-top:10px;">
+      <thead><tr><th>Page</th><th>Run 1 · baseline</th><th>Run 2</th></tr></thead>
+      <tbody>
+        {% for d in final_diffs %}
+        <tr>
+          <td><a class="dc-url" href="{{ d.url }}" target="_blank" rel="noopener" title="{{ d.url }}">{{ d.title or d.url }}</a></td>
+          <td>{% if d.base_final %}<span class="kd keep">IN</span>{% else %}<span class="kd drop">OUT</span>{% endif %}</td>
+          <td>{% if d.other_final %}<span class="kd keep">IN</span>{% else %}<span class="kd drop">OUT</span>{% endif %}</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+    {% endif %}
+  </details>
+
+  <section class="phase-block" data-phase="inclusion">
+    <div class="pb-head">
+      <h2>Phase 1 — Inclusion disagreements <span class="count">{{ p1_cards|length }}</span></h2>
+      {% if p1_cards %}<button class="btn secondary-btn explain-all" type="button" data-phase="inclusion">Explain all</button>{% endif %}
+    </div>
+    {% if p1_cards %}{% for c in p1_cards %}{{ card(c, base_has_excl, other_has_excl) }}{% endfor %}
+    {% else %}<p class="muted-sm">No inclusion-phase disagreements — the two runs kept/dropped the same pages at Phase 1.</p>{% endif %}
+  </section>
+
+  <section class="phase-block" data-phase="exclusion">
+    <div class="pb-head">
+      <h2>Phase 2 — Exclusion disagreements <span class="count">{{ p2_cards|length }}</span></h2>
+      {% if p2_cards %}<button class="btn secondary-btn explain-all" type="button" data-phase="exclusion">Explain all</button>{% endif %}
+    </div>
+    {% if p2_cards %}{% for c in p2_cards %}{{ card(c, base_has_excl, other_has_excl) }}{% endfor %}
+    {% else %}<p class="muted-sm">No exclusion-phase disagreements — where both runs ran Phase 2 they agreed.</p>{% endif %}
+  </section>
+
+  <section class="suggest-block card">
+    <h2 style="margin-top:0;">Improve the prompt from your judgements</h2>
+    <p class="muted-sm" style="margin-top:2px;">Mark <strong>which run is right</strong> on the divergences above, then
+      generate suggested edits to this shortlist's <strong>include / exclude criteria</strong> that would reduce the
+      disagreement. Suggestions are copyable — nothing is applied automatically. Re-run and compare to see if divergence drops.</p>
+    <div class="suggest-actions">
+      <button class="btn suggest-btn" type="button">Suggest criteria improvements</button>
+      <span class="judged-note"><strong id="judged-n">{{ judged_count }}</strong> judged</span>
+      <span class="v-note">from {{ judge_label }}</span>
+    </div>
+    <div class="suggest-out" hidden></div>
+  </section>
+  {% endif %}
+
+  <style>
+    .final-diff { margin:0 0 26px; }
+    .final-diff > summary { cursor:pointer; font-size:16px; }
+    .runs-strip { display:grid; grid-template-columns:1fr 1fr; gap:14px; margin:18px 0 26px; }
+    @media (max-width:640px){ .runs-strip { grid-template-columns:1fr; } }
+    .run-col { border:1px solid var(--border); border-radius:var(--radius); padding:12px 14px; background:var(--surface); }
+    .rc-tag { font-size:12px; font-weight:700; letter-spacing:.03em; text-transform:uppercase; color:var(--muted); }
+    .rc-tag.alt { color:var(--blue); }
+    .rc-name { font-weight:700; font-size:17px; margin:2px 0 4px; }
+    .rc-meta { font-size:13px; color:var(--muted); }
+    .rc-meta.mono, .mono { font-family:ui-monospace,SFMono-Regular,Menlo,monospace; }
+    .phase-block { margin:0 0 30px; }
+    .pb-head { display:flex; align-items:center; gap:14px; border-bottom:2px solid var(--border); padding-bottom:6px; margin-bottom:14px; }
+    .pb-head h2 { margin:0; font-size:19px; }
+    .count { display:inline-block; min-width:22px; text-align:center; background:var(--surface-3); color:var(--ink);
+      border-radius:999px; font-size:13px; font-weight:700; padding:1px 9px; margin-left:4px; }
+    .explain-all { margin-left:auto; padding:6px 12px; font-size:14px; }
+    .diff-card { padding:14px 16px; margin:0 0 14px; }
+    .dc-head { display:flex; align-items:baseline; gap:12px; flex-wrap:wrap; margin-bottom:10px; }
+    .dc-url { font-size:14px; overflow-wrap:anywhere; color:var(--blue); font-weight:600; }
+    .dc-kw { display:inline-flex; flex-wrap:wrap; gap:4px; }
+    .kw-pill { display:inline-block; font-size:11px; font-weight:600; padding:1px 8px; border-radius:999px; background:#e8f1f8; color:#0b3d6b; }
+    /* Grounding evidence shown under each phase's reason. */
+    .ev { margin:6px 0 0; padding-top:6px; border-top:1px dashed var(--border); }
+    .ev-topic { font-size:12px; color:var(--muted); }
+    .ev-quotes { margin:4px 0 0; padding-left:16px; font-size:12px; color:var(--ink); }
+    .ev-quotes li { margin:2px 0; }
+    .dc-phase { font-size:11px; font-weight:700; text-transform:uppercase; letter-spacing:.03em; padding:2px 8px; border-radius:999px; white-space:nowrap; }
+    .dc-phase.inclusion { background:#e8f1fb; color:#1d4e89; }
+    .dc-phase.exclusion { background:#fbeee8; color:#8a3a1a; }
+    .dc-table { font-size:14px; width:100%; }
+    .dc-table th, .dc-table td { vertical-align:top; text-align:left; padding:8px 10px; }
+    .dc-table thead th { font-size:11px; text-transform:uppercase; letter-spacing:.02em; color:var(--muted); font-weight:700; border-bottom:1px solid var(--border); }
+    .rowlab { white-space:nowrap; font-weight:700; }
+    .rsn-col { min-width:200px; width:34%; }
+    .rsn { max-height:150px; overflow:auto; line-height:1.4; }
+    td.hot, th.hot { background:#fff8e6; }
+    .muted-sm { color:var(--muted); font-size:13px; }
+    .kd { display:inline-block; font-size:12px; font-weight:700; padding:2px 9px; border-radius:999px; }
+    .kd.keep { background:#d9f2e4; color:var(--green-dark); }
+    .kd.drop { background:#fbe0db; color:#a5200f; }
+    .kd.none { background:var(--surface-3); color:var(--muted); }
+    .score { display:inline-block; margin-left:6px; font-size:12px; font-weight:600; color:var(--muted);
+      font-variant-numeric:tabular-nums; }
+    .verdict { margin-top:12px; border-top:1px dashed var(--border); padding-top:10px; }
+    .v-note { font-size:12px; color:var(--muted); margin-left:10px; }
+    .v-body { background:var(--surface-2); border-left:4px solid var(--blue); border-radius:0 var(--radius-sm) var(--radius-sm) 0;
+      padding:10px 14px; font-size:14px; line-height:1.5; }
+    .v-body.err { border-left-color:var(--red); }
+    .adjud { display:flex; align-items:center; gap:10px; margin-top:12px; flex-wrap:wrap; }
+    .adjud-q { font-size:13px; font-weight:700; color:var(--muted); }
+    .adjud-opts { display:inline-flex; gap:0; border:1px solid var(--border-mid); border-radius:999px; overflow:hidden; }
+    .adjud-btn { background:var(--surface); border:none; border-right:1px solid var(--border); padding:5px 14px;
+      font-size:13px; font-weight:600; color:var(--ink); cursor:pointer; }
+    .adjud-btn:last-child { border-right:none; }
+    .adjud-btn:hover { background:var(--surface-3); }
+    .adjud-btn.on { background:var(--blue); color:var(--white); }
+    .adjud-btn.on.neither { background:var(--muted); }
+    .suggest-block { padding:16px 18px; margin-top:22px; }
+    .suggest-actions { display:flex; align-items:center; gap:14px; flex-wrap:wrap; margin-top:12px; }
+    .judged-note { font-size:14px; color:var(--ink); }
+    .suggest-out { margin-top:16px; }
+    .suggest-out pre { white-space:pre-wrap; word-wrap:break-word; background:var(--surface-2); border:1px solid var(--border);
+      border-left:4px solid var(--blue); border-radius:0 var(--radius-sm) var(--radius-sm) 0; padding:14px 16px;
+      font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:13px; line-height:1.55; margin:0; }
+    .suggest-out.err pre { border-left-color:var(--red); }
+    .suggest-copy { margin-top:10px; }
+  </style>
+
+  <script>
+    const CID = {{ category.id }};
+    const BASE = {{ base_head|tojson }};
+    const OTHER = {{ other_head|tojson }};
+
+    async function explain(cardEl) {
+      const box = cardEl.querySelector(".verdict");
+      if (box.dataset.has === "1" || box.dataset.busy === "1") return;
+      const btn = box.querySelector(".v-btn");
+      box.dataset.busy = "1";
+      if (btn) { btn.disabled = true; btn.textContent = "Thinking…"; }
+      try {
+        const r = await fetch(`/api/categories/${CID}/performance/diff/explain`, {
+          method: "POST", headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ base: BASE, other: OTHER, url: cardEl.dataset.url, phase: cardEl.dataset.phase })
+        });
+        const j = await r.json();
+        if (!r.ok || j.error) throw new Error(j.error || ("HTTP " + r.status));
+        box.innerHTML = `<div class="v-body">${escapeHtml(j.verdict || "")}</div>`;
+        box.dataset.has = "1";
+      } catch (e) {
+        box.innerHTML = `<div class="v-body err">Couldn't generate a verdict: ${escapeHtml(String(e.message || e))}</div>`
+          + `<button class="btn secondary-btn v-btn" type="button">Try again</button>`;
+      } finally { box.dataset.busy = ""; bind(); }
+    }
+
+    function escapeHtml(s) { const d = document.createElement("div"); d.textContent = s; return d.innerHTML; }
+
+    function bind() {
+      document.querySelectorAll(".v-btn").forEach(b => { b.onclick = () => explain(b.closest(".diff-card")); });
+    }
+
+    // ---- adjudication: mark which run is right ----
+    function paintAdjud(wrap) {
+      const choice = wrap.dataset.choice || "";
+      wrap.querySelectorAll(".adjud-btn").forEach(b => {
+        b.classList.toggle("on", b.dataset.choice === choice);
+        b.classList.toggle("neither", b.dataset.choice === "neither");
+      });
+    }
+    async function adjudicate(card, choice) {
+      const wrap = card.querySelector(".adjud");
+      const next = (wrap.dataset.choice === choice) ? "" : choice;   // click again to clear
+      const prev = wrap.dataset.choice;
+      wrap.dataset.choice = next; paintAdjud(wrap);                  // optimistic
+      try {
+        const r = await fetch(`/api/categories/${CID}/performance/diff/adjudicate`, {
+          method: "POST", headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ base: BASE, other: OTHER, url: card.dataset.url, phase: card.dataset.phase, choice: next })
+        });
+        const j = await r.json();
+        if (!r.ok || j.error) throw new Error(j.error || ("HTTP " + r.status));
+        const n = document.getElementById("judged-n"); if (n && j.judged != null) n.textContent = j.judged;
+      } catch (e) { wrap.dataset.choice = prev; paintAdjud(wrap); alert("Couldn't save: " + (e.message || e)); }
+    }
+    document.querySelectorAll(".adjud").forEach(paintAdjud);
+    document.querySelectorAll(".adjud-btn").forEach(b => {
+      b.onclick = () => adjudicate(b.closest(".diff-card"), b.dataset.choice);
+    });
+
+    // ---- suggest criteria improvements from the judged cases ----
+    const suggestBtn = document.querySelector(".suggest-btn");
+    if (suggestBtn) suggestBtn.onclick = async () => {
+      const out = document.querySelector(".suggest-out");
+      const judged = parseInt(document.getElementById("judged-n").textContent || "0", 10);
+      if (!judged) { alert("Mark which run is right on at least one divergence first."); return; }
+      suggestBtn.disabled = true; const label = suggestBtn.textContent; suggestBtn.textContent = "Thinking…";
+      out.hidden = false; out.className = "suggest-out"; out.innerHTML = `<p class="muted-sm">Generating from ${judged} judged case${judged > 1 ? "s" : ""}…</p>`;
+      try {
+        const r = await fetch(`/api/categories/${CID}/performance/diff/suggest`, {
+          method: "POST", headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ base: BASE, other: OTHER })
+        });
+        const j = await r.json();
+        if (!r.ok || j.error) throw new Error(j.error || ("HTTP " + r.status));
+        out.innerHTML = `<pre></pre><button class="btn secondary-btn suggest-copy" type="button">Copy suggestion</button>`
+          + `<span class="v-note">${escapeHtml(String(j.model || ""))} · ${j.judged} case${j.judged > 1 ? "s" : ""}</span>`;
+        out.querySelector("pre").textContent = j.suggestion || "";
+        out.querySelector(".suggest-copy").onclick = () => {
+          navigator.clipboard.writeText(j.suggestion || "");
+          out.querySelector(".suggest-copy").textContent = "Copied ✓";
+        };
+      } catch (e) {
+        out.className = "suggest-out err";
+        out.innerHTML = `<pre>Couldn't generate suggestions: ${escapeHtml(String(e.message || e))}</pre>`;
+      } finally { suggestBtn.disabled = false; suggestBtn.textContent = label; }
+    };
+
+    document.querySelectorAll(".explain-all").forEach(btn => {
+      btn.onclick = async () => {
+        const phase = btn.dataset.phase;
+        const pending = [...document.querySelectorAll(`.phase-block[data-phase="${phase}"] .diff-card`)]
+          .filter(c => c.querySelector(".verdict").dataset.has !== "1");
+        if (!pending.length) return;
+        if (!confirm(`Generate ${pending.length} LLM verdict${pending.length > 1 ? "s" : ""} for this phase? Each is one model call (billed).`)) return;
+        btn.disabled = true; const label = btn.textContent;
+        for (let i = 0; i < pending.length; i++) { btn.textContent = `Explaining ${i + 1}/${pending.length}…`; await explain(pending[i]); }
+        btn.textContent = label; btn.disabled = false;
+      };
+    });
+
+    bind();
+  </script>
+{% endblock %}

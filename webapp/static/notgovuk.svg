@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1040 168" role="img"
+     aria-label="NOT.GOV.UK">
+  <style>.wm { font-family:"Arial Black","Helvetica Neue",Arial,sans-serif; font-weight:900; }</style>
+  <!-- Wordmark: light grey with the two dots in cyan. textLength pins the width so
+       the whole word fits the viewBox (an <img>-rendered SVG clips to the viewBox). -->
+  <text x="8" y="150" class="wm" font-size="185" fill="#e7e9e9"
+        textLength="1024" lengthAdjust="spacingAndGlyphs">NOT<tspan fill="#10e0e6">.</tspan>GOV<tspan fill="#10e0e6">.</tspan>UK</text>
+</svg>

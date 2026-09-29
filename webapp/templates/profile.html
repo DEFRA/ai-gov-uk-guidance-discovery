@@ -1,0 +1,117 @@
+{% extends "base.html" %}
+{% block page_id %}guc-0016{% endblock %}
+{% block title %}Profile{% endblock %}
+{% block content %}
+  <a class="back" href="{{ url_for('list_categories_page') }}">‹ Shortlists</a>
+  <h1 style="margin:16px 0 18px;">Your profile</h1>
+
+  {% if accounts_mode and me %}
+  <div class="tabs" role="tablist" style="margin:0 0 22px;">
+    <a href="#" class="stab current" data-tab="details">Your details</a>
+    <a href="#" class="stab" data-tab="password">Password</a>
+    <a href="#" class="stab" data-tab="interface">Interface complexity</a>
+  </div>
+
+  <!-- Section 1: Your details (name, email) -->
+  <section class="stabpanel" data-tab="details" id="details" style="max-width:660px;margin:0 0 40px;">
+    <h2 style="margin:0 0 12px;">Your details</h2>
+
+    {% if details_ok %}<div class="success">Your details were saved.</div>{% endif %}
+    {% if details_error %}<div class="error-summary"><h2>There is a problem</h2>
+      <ul><li>{{ details_error }}</li></ul></div>{% endif %}
+
+    <form method="post" action="{{ url_for('update_profile_details') }}">
+      <input type="hidden" name="csrf" value="{{ csrf_token }}">
+      <div class="field"><label class="q" for="first_name">First name</label>
+        <input id="first_name" name="first_name" type="text" value="{{ me.first_name or '' }}"></div>
+      <div class="field"><label class="q" for="last_name">Last name</label>
+        <input id="last_name" name="last_name" type="text" value="{{ me.last_name or '' }}"></div>
+      <div class="field"><label class="q" for="email">Email address</label>
+        <input id="email" type="email" value="{{ me.email }}" readonly
+          style="background:var(--surface-2);color:var(--muted);">
+        <span class="hint" style="display:block;margin-top:6px;">This is your sign-in and can't be changed here.</span></div>
+      <button class="btn" type="submit">Save details</button>
+    </form>
+  </section>
+
+  <!-- Section 2: Password -->
+  <section class="stabpanel" data-tab="password" id="password" style="max-width:660px;margin:0 0 40px;" hidden>
+    <h2 style="margin:0 0 12px;">Change your password</h2>
+    {% if pw_ok %}<div class="success">Your password was changed.</div>{% endif %}
+    {% if pw_error %}<div class="error-summary"><h2>There is a problem</h2>
+      <ul><li>{{ pw_error }}</li></ul></div>{% endif %}
+    <p class="hint" style="margin:0 0 14px;">Enter your current password, then choose a new one.</p>
+    <form method="post" action="{{ url_for('change_own_password') }}">
+      <input type="hidden" name="csrf" value="{{ csrf_token }}">
+      <div class="field"><label class="q" for="current_password">Current password</label>
+        <input id="current_password" name="current_password" type="password" autocomplete="current-password"></div>
+      <div class="field"><label class="q" for="new_password">New password</label>
+        <input id="new_password" name="new_password" type="password" autocomplete="new-password">
+        <span class="hint" style="display:block;margin-top:6px;">At least 8 characters — a short phrase of
+          three random words is easy to remember and hard to guess.</span></div>
+      <div class="field"><label class="q" for="confirm_password">Confirm new password</label>
+        <input id="confirm_password" name="confirm_password" type="password" autocomplete="new-password"></div>
+      <button class="btn" type="submit">Change password</button>
+    </form>
+  </section>
+  {% endif %}
+
+  <!-- Section 2: Interface complexity (per-browser display level) -->
+  <section class="stabpanel" data-tab="interface" id="interface" style="max-width:660px;"
+    {% if accounts_mode and me %}hidden{% endif %}>
+    <h2 style="margin:0 0 6px;">Interface complexity</h2>
+    <p class="hint">Choose how much of the interface you want to see. Higher levels reveal more detail; lower
+      levels keep things focused. This is saved in this browser and takes effect straight away — change it any time.</p>
+
+    <div id="levels" style="display:flex;flex-direction:column;gap:12px;margin:18px 0;">
+      {% for key, title, desc in levels %}
+      <label class="level-card" data-level-key="{{ key }}">
+        <input type="radio" name="ui_level" value="{{ key }}">
+        <span><strong>{{ title }}</strong>
+          <span class="secondary" style="display:block;font-size:14px;margin-top:2px;">{{ desc }}</span></span>
+      </label>
+      {% endfor %}
+    </div>
+    <p id="profile-status" class="secondary"></p>
+  </section>
+
+  <script>
+    // The display level is stored per-browser and applied as a data-ui-level attribute on
+    // <html>; CSS hides elements marked for a higher level (see govuk.css). New users default
+    // to Simple (set on first login in base.html); they can pick a higher level here.
+    function currentLevel() { try { var l = localStorage.getItem("ui_level"); return (l === "simple" || l === "advanced") ? l : (l ? "advanced" : "simple"); } catch (e) { return "simple"; } }
+    function apply(level) {
+      document.documentElement.setAttribute("data-ui-level", level);
+      try { localStorage.setItem("ui_level", level); } catch (e) {}
+    }
+    (function () {
+      const cur = currentLevel();
+      const cards = document.querySelectorAll(".level-card");
+      document.querySelectorAll('input[name="ui_level"]').forEach(r => {
+        r.checked = (r.value === cur);
+        r.addEventListener("change", () => {
+          apply(r.value);
+          cards.forEach(c => c.classList.toggle("current", c.dataset.levelKey === r.value));
+          document.getElementById("profile-status").textContent =
+            "Saved — showing the " + r.value.charAt(0).toUpperCase() + r.value.slice(1) + " view.";
+        });
+      });
+      cards.forEach(c => c.classList.toggle("current", c.dataset.levelKey === cur));
+    })();
+
+    // Profile tabs (Your details / Interface complexity).
+    (function () {
+      const tabs = [...document.querySelectorAll(".stab")];
+      const panels = [...document.querySelectorAll(".stabpanel")];
+      if (!tabs.length) return;
+      function show(t) {
+        tabs.forEach(a => a.classList.toggle("current", a.dataset.tab === t));
+        panels.forEach(p => p.hidden = p.dataset.tab !== t);
+      }
+      tabs.forEach(a => a.addEventListener("click", e => { e.preventDefault(); show(a.dataset.tab); }));
+      // Open the tab a save redirect targeted (#password / #interface), else Your details.
+      const h = location.hash;
+      show(h === "#interface" ? "interface" : (h === "#password" ? "password" : "details"));
+    })();
+  </script>
+{% endblock %}

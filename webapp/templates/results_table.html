@@ -1,0 +1,121 @@
+{% extends "base.html" %}
+{% from "_sql.html" import sql_panel %}
+{% block page_id %}guc-0007{% endblock %}
+{% block title %}{{ category.display_name }} — results{% endblock %}
+{% block content %}
+
+  <a class="back" href="{{ url_for('preview_category_page', cid=category.id) }}">‹ Back to results</a>
+
+  <h1 style="margin:18px 0 4px;">Results</h1>
+  <p class="secondary" style="margin:0 0 10px;">{{ category.display_name }}
+    (<span class="mono">{{ category.slug or '' }}</span>) · <span id="total">…</span> pages ·
+    <a href="{{ url_for('download_page', cid=category.id) }}">Download…</a></p>
+
+  <details style="margin:0 0 16px;max-width:720px;">
+    <summary style="cursor:pointer;font-weight:700;">Columns</summary>
+    <div style="display:flex;flex-wrap:wrap;gap:8px 26px;margin-top:10px;">
+      {% for section, fields in sections %}
+      <div>
+        <div class="secondary" style="font-weight:700;font-size:13px;margin-bottom:4px;">{{ section }}</div>
+        {% for key, label, default_on in fields %}
+        <label class="check" style="display:block;font-size:14px;">
+          <input type="checkbox" class="col-toggle" value="{{ key }}" {{ 'checked' if default_on }}> {{ label }}
+        </label>
+        {% endfor %}
+      </div>
+      {% endfor %}
+    </div>
+  </details>
+
+  <div class="controls" style="margin:0 0 12px;align-items:center;gap:8px;">
+    <input id="search" type="search" placeholder="Search titles across all results…"
+      style="padding:8px 10px;border:2px solid var(--black);border-radius:6px;min-width:280px;font:inherit;">
+    <button class="btn secondary-btn" id="search-btn" type="button">Search</button>
+    <button class="btn secondary-btn" id="clear-btn" type="button" hidden>Clear</button>
+  </div>
+
+  <div style="overflow-x:auto;">
+    <table id="results" style="font-size:14px;"><thead></thead><tbody></tbody></table>
+  </div>
+  <p id="empty" class="secondary" hidden>No pages in this shortlist.</p>
+
+  <div id="pager" class="controls" style="margin-top:12px;align-items:center;" hidden>
+    <button class="btn secondary-btn" id="prev" type="button">‹ Prev</button>
+    <span id="range" class="secondary"></span>
+    <button class="btn secondary-btn" id="next" type="button">Next ›</button>
+  </div>
+  <p id="status" class="secondary"></p>
+  {{ sql_panel("results-sql") }}
+
+  <script>
+    const CID = {{ category.id }};
+    const PAGE = 50;
+    let offset = 0, total = 0, rows = [], query = "";
+    // key -> label, in section order (for headers).
+    const COLS = [{% for section, fields in sections %}{% for key, label, d in fields %}{key:"{{ key }}",label:"{{ label }}"},{% endfor %}{% endfor %}];
+    const fmtInt = n => Number(n||0).toLocaleString();
+    function esc(s){const d=document.createElement("div");d.textContent=s==null?"":s;return d.innerHTML;}
+    function selectedKeys(){
+      const on = new Set([...document.querySelectorAll(".col-toggle:checked")].map(c=>c.value));
+      return COLS.filter(c=>on.has(c.key));
+    }
+    function fmtDate(s){ return s ? String(s).slice(0,10) : "—"; }
+    function cell(key, r){
+      const v = r[key];
+      if (key === "title") return `<a href="${esc(r.url)}">${esc(v || r.url)}</a>`;
+      if (key === "url")   return `<a href="${esc(v)}">${esc(v)}</a>`;
+      if (key === "public_updated_at" || key === "first_published_at") return esc(fmtDate(v));
+      if (v == null || v === "") return "—";
+      return esc(v);
+    }
+    function render(){
+      const cols = selectedKeys();
+      document.querySelector("#results thead").innerHTML =
+        "<tr>" + cols.map(c=>`<th>${esc(c.label)}</th>`).join("") + "</tr>";
+      document.querySelector("#results tbody").innerHTML =
+        rows.map(r => "<tr>" + cols.map(c=>`<td>${cell(c.key, r)}</td>`).join("") + "</tr>").join("");
+    }
+    async function load(){
+      document.getElementById("status").innerHTML = '<span class="spinner"></span> Loading…';
+      try {
+        const url = `/api/categories/${CID}/results-table?limit=${PAGE}&offset=${offset}`
+          + (query ? `&q=${encodeURIComponent(query)}` : "");
+        const j = await (await fetch(url)).json();
+        if (j.error) { document.getElementById("status").textContent = "Error: " + j.error; return; }
+        if (window.setSqlPanel) setSqlPanel("results-sql", j.sql);
+        total = j.total; rows = j.rows || [];   // total may be null if the count was slow
+        const known = total != null;
+        document.getElementById("total").textContent = known ? fmtInt(total) : "?";
+        document.getElementById("empty").hidden = rows.length !== 0 || (known && total !== 0);
+        render();
+        const from = rows.length ? offset + 1 : 0, to = offset + rows.length;
+        document.getElementById("range").textContent =
+          `${fmtInt(from)}–${fmtInt(to)}` + (known ? ` of ${fmtInt(total)}` : "");
+        document.getElementById("prev").disabled = offset <= 0;
+        // With an unknown total, allow Next while a full page came back.
+        document.getElementById("next").disabled = known ? (offset + PAGE >= total) : (rows.length < PAGE);
+        document.getElementById("pager").hidden = offset === 0 && rows.length < PAGE;
+        document.getElementById("status").textContent = "";
+      } catch(e){ document.getElementById("status").textContent = "Could not load results."; }
+    }
+    document.querySelectorAll(".col-toggle").forEach(c => c.addEventListener("change", render));
+    document.getElementById("prev").addEventListener("click", () => { offset = Math.max(0, offset - PAGE); load(); });
+    document.getElementById("next").addEventListener("click", () => { offset += PAGE; load(); });
+
+    // Title search across the whole shortlist (server-side), not just the page.
+    const searchInput = document.getElementById("search");
+    function runSearch() {
+      query = searchInput.value.trim();
+      offset = 0;
+      document.getElementById("clear-btn").hidden = !query;
+      document.getElementById("empty").textContent =
+        query ? `No titles match “${query}”.` : "No pages in this shortlist.";
+      load();
+    }
+    document.getElementById("search-btn").addEventListener("click", runSearch);
+    searchInput.addEventListener("keydown", e => { if (e.key === "Enter") { e.preventDefault(); runSearch(); } });
+    document.getElementById("clear-btn").addEventListener("click", () => { searchInput.value = ""; runSearch(); });
+
+    load();
+  </script>
+{% endblock %}

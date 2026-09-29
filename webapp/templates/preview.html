@@ -1,0 +1,685 @@
+{% extends "base.html" %}
+{% from "_category_tabs.html" import category_tabs with context %}
+{% from "_sql.html" import sql_panel %}
+{% set page_ref = "guc-0003" %}
+{% block page_id %}{{ page_ref }}{% endblock %}
+{% block title %}{{ category.display_name }} — explainability{% endblock %}
+{% block content %}
+  <style>
+    /* Plain-English summary panel at the top of the Explainability tab. */
+    .explain-summary { background:#eef3f8; border:1px solid #c9d7e6; border-left:4px solid var(--blue,#1d70b8);
+      border-radius:8px; padding:12px 16px; margin:0 0 22px; max-width:900px; }
+    .explain-summary .es-tag { display:inline-block; font-size:11px; font-weight:700; text-transform:uppercase;
+      letter-spacing:.05em; color:var(--dark-blue,#003078); margin-bottom:4px; }
+    .explain-summary .es-lead { margin:0; font-size:16px; line-height:1.5; }
+    .explain-summary .es-outcome { margin:8px 0 0; font-size:15px; line-height:1.5; color:#33475b; }
+    /* Runs table "Pages" cell: evaluated / current-shortlist target, with a drift chip. */
+    .pg-sub { color:var(--muted,#6b7477); font-weight:400; }
+    .pg-drift { display:inline-block; margin-left:6px; font-size:11px; font-weight:700; padding:0 6px;
+      border-radius:999px; background:#fdf0e6; color:#8a4b12; vertical-align:middle; cursor:help; }
+    /* Stalled-run banner + per-run status chips. */
+    .sd-warn { background:#fdf0ee; border:1px solid #e6b8ae; border-left:4px solid #d4351c;
+      border-radius:6px; padding:12px 14px; max-width:900px; font-size:14px; }
+    .sd-warn .hd { font-weight:700; color:#942514; }
+    .run-chip { display:inline-block; font-size:11px; font-weight:700; padding:1px 7px; border-radius:999px;
+      margin-left:6px; vertical-align:middle; }
+    .run-chip.running { background:#d2e2f1; color:#0b3d6b; }
+    .run-chip.stalled { background:#fbe5d6; color:#8a3b12; }
+    .run-chip.stopped-warn { background:#fdf3d8; color:#7a5b00; }
+    .run-chip.stopped-bad { background:#f6d7d2; color:#942316; }
+    /* Provenance lozenges for GOV.UK Search coverage. */
+    .prov { display:inline-block; font-size:12px; font-weight:700; padding:2px 9px; border-radius:999px; white-space:nowrap; }
+    .prov-search { background:#fbe5d6; color:#8a3b12; }        /* gap: GOV.UK Search only */
+    .prov-both { background:#d9f2e4; color:var(--green-dark,#00703c); }
+    .prov-shortlister { background:#e8f1fb; color:var(--dark-blue,#003078); }
+    /* Keyword-hit lozenges: which terms put a page in the shortlist / GOV.UK results. */
+    .kw-hits { display:flex; flex-wrap:wrap; gap:4px; }
+    .kw-hit { display:inline-block; font-size:12px; font-weight:600; padding:1px 8px; border-radius:999px;
+      white-space:nowrap; border:1px solid transparent; }
+    .kw-corpus { background:#eef3ff; color:var(--dark-blue,#003078); border-color:#cfe0f7; }  /* corpus term */
+    .kw-govuk { background:#fdeee2; color:#8a3b12; border-color:#f3d6bf; }                     /* GOV.UK term */
+    .kw-none { color:var(--muted,#6b7477); font-size:12px; }
+    /* In-corpus status: is this URL loaded into our corpus yet? */
+    .ld { display:inline-block; font-size:12px; font-weight:700; padding:2px 9px; border-radius:999px; white-space:nowrap; }
+    .ld-yes { background:#d9f2e4; color:var(--green-dark,#00703c); }
+    .ld-no { background:#f3f2f1; color:var(--muted,#6b7477); }
+    /* GOV.UK threshold-hit warning (coverage may be truncated). */
+    .gc-warn { background:#fef7e0; border:1px solid #f2d888; border-left:4px solid #e0a800;
+      border-radius:6px; padding:10px 12px; margin:8px 0 0; font-size:14px; }
+    .gc-ok { background:#e9f5ee; border:1px solid #b9e0c9; border-left:4px solid var(--green-dark,#00703c);
+      border-radius:6px; padding:10px 12px; margin:8px 0 0; font-size:14px; }
+    /* Side-by-side breakdown panels with compact bars. auto-fit lets a single
+       visible panel (e.g. no keywords) expand to full width. */
+    .breakdowns { display:grid; grid-template-columns:repeat(auto-fit, minmax(300px, 1fr));
+      gap:10px 32px; margin-top:24px; align-items:start; }
+    .breakdowns > div { margin-top:0 !important; }
+    .breakdowns table { margin-bottom:0; }
+    .bd-name { max-width:190px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;
+      font-size:13px; padding:2px 8px 2px 0; }
+    .bd-cell { width:100%; padding:2px 8px; }
+    .bd-track { background:#eef0f1; border-radius:999px; height:9px; }
+    .bd-fill { height:100%; background:var(--blue,#1d70b8); border-radius:999px; }
+    .bd-val { text-align:right; font-weight:700; font-size:13px; white-space:nowrap;
+      padding:2px 0; font-variant-numeric:tabular-nums; }
+    /* Selection funnel: Sankey and table side by side, stacking when narrow. */
+    .funnel-layout { display:flex; gap:28px; align-items:flex-start; flex-wrap:wrap; margin:0 0 22px; }
+    .funnel-layout .funnel-sankey { flex:1 1 460px; min-width:0; overflow-x:auto; }
+    .funnel-layout #funnel { flex:1 1 300px; margin:0; }
+    /* Compact funnel table: smaller text and single-line rows so labels fit,
+       with headings still allowed to wrap. Scoped to the funnel table only. */
+    #funnel { font-size:13px; }
+    #funnel th, #funnel td { padding:6px 10px; }
+    #funnel th { white-space:normal; }
+    #funnel td { white-space:nowrap; }
+    #funnel td .detail { white-space:normal; }  /* expanded filter values still wrap */
+  </style>
+
+  <h1 style="margin:20px 0 6px;">{{ category.display_name }}</h1>
+  <p class="lede" style="margin:0 0 20px;max-width:820px;">Explainability — how this shortlist was reached: which
+    keywords matched, how GOV.UK Search compares, and how each stage of the pipeline added or removed pages.</p>
+
+  {{ category_tabs(category, 'explain') }}
+
+  <div class="tabpanel">
+    <!-- Plain-English summary: the recipe (server-rendered from the filters) plus the live
+         outcome numbers (filled by updateExplainSummary() once the funnel + runs load). -->
+    {% set kws = filters.keywords if filters else [] %}
+    {% set n_orgs = (filters.organisations | length) if filters else 0 %}
+    {% set n_dts = (filters.document_types | length) if filters else 0 %}
+    <section class="explain-summary" aria-label="Plain-English summary">
+      <span class="es-tag">In plain English</span>
+      <p class="es-lead">This shortlist looks across
+        <strong>{{ ('all of GOV.UK' if n_orgs == 0 else (n_orgs ~ ' organisation' ~ ('' if n_orgs == 1 else 's'))) }}</strong>
+        and <strong>{{ ('every type of page' if n_dts == 0 else (n_dts ~ ' page type' ~ ('' if n_dts == 1 else 's'))) }}</strong>,
+        keeping pages that mention
+        {% if kws %}<strong>{% for k in kws[:6] %}“{{ k }}”{% if not loop.last %}, {% endif %}{% endfor %}{% if kws|length > 6 %} and {{ kws|length - 6 }} more{% endif %}</strong>{% else %}<strong>any content</strong>{% endif %}.
+        Matching pages are then reviewed by AI — first to include anything relevant, then to remove edge
+        cases — to reach the final shortlist.</p>
+      <p class="es-outcome" id="explain-outcome">Working out the numbers…</p>
+    </section>
+
+    <!-- Selection funnel: shown above the sub-tabs, so it's visible for both modes. -->
+    <div style="display:flex;justify-content:space-between;align-items:baseline;flex-wrap:wrap;gap:8px;">
+      <h2 style="margin:0;">Selection funnel</h2>
+      <button type="button" class="btn secondary-btn" id="refresh-funnel"
+        style="padding:4px 12px;font-size:14px;" title="Clear the cached counts and re-run the funnel">↻ Refresh</button>
+    </div>
+    <p class="hint" style="margin-top:6px;">How each filter narrows the corpus. Each row is timed as it runs.
+      Counts are cached until the definition or corpus changes — use Refresh to force a recompute.</p>
+    <div class="funnel-layout">
+      <div class="funnel-sankey">
+        <svg id="sankey" style="width:100%;min-width:460px;height:300px;"></svg>
+      </div>
+
+      {# Funnel table mirrors the Sankey stages: label, count passing (Next Stage),
+         count dropped here (Rejected), and time. Deterministic rows are server-
+         rendered; the AI rows (Included by AI / Shortlist) are revealed by JS once
+         their runs exist. #}
+      {% set stage_names = {'all':'All Pages','org':'Matched Orgs','doctype':'Matched Doc Type','keyword':'Contains Keywords'} %}
+      <table id="funnel">
+      <thead><tr><th>Labels</th><th class="num">Next Stage</th><th class="num">Rejected</th><th class="num">Time</th><th class="num">Cost</th></tr></thead>
+      <tbody>
+        {% for s in stages %}
+        <tr data-stage="{{ s.stage }}">
+          <td>{% if s.vals %}<details class="filter-values">
+              <summary>{{ stage_names.get(s.stage, s.label) }} ({{ s.vals|length }})</summary>
+              <div class="detail" style="max-width:none;">{{ s.vals|join(', ') }}</div>
+            </details>{% else %}{{ stage_names.get(s.stage, s.label) }}{% endif %}
+          </td>
+          <td class="num val"><span class="spinner"></span></td>
+          <td class="num rejected"></td>
+          <td class="num timing"></td>
+          <td class="num cost secondary" title="Deterministic filters use no AI, so they cost nothing.">N/A</td>
+        </tr>
+        {% endfor %}
+        <tr id="funnel-govuk" data-stage="govuk" hidden title="GOV.UK-Search-only pages the keyword filter missed, added to the AI's input on top of the keyword shortlist = what the AI evaluated minus the keyword shortlist.">
+          <td><a href="{{ url_for('govuk_additions_page', cid=category.id) }}" title="Review the GOV.UK-Search additions — URL, document type, organisations, and which GOV.UK keyword caught each">+ GOV.UK Search</a></td>
+          <td class="num" id="govuk-val" style="color:var(--green,#00703c);font-weight:700;"></td>
+          <td class="num secondary">—</td>
+          <td class="num secondary">—</td>
+          <td class="num cost secondary" title="GOV.UK Search adds coverage, not a filter — no AI cost at this step.">N/A</td>
+        </tr>
+        <tr data-stage="incl" hidden><td>Included by AI</td><td class="num val"></td><td class="num rejected"></td><td class="num timing"></td>
+          <td class="num cost" title="Total AI spend on the inclusion pass for this shortlist (all runs).">${{ '%.2f'|format(ai_cost.incl) }}</td></tr>
+        <tr data-stage="excl" hidden><td>Shortlist</td><td class="num val"></td><td class="num rejected"></td><td class="num timing"></td>
+          <td class="num cost" title="Total AI spend on the exclusion pass for this shortlist (all runs).">${{ '%.2f'|format(ai_cost.excl) }}</td></tr>
+      </tbody>
+      </table>
+    </div>
+
+    <div class="tabs" role="tablist" style="margin-bottom:22px;">
+      <a href="#" class="subtab current" data-tab="hybrid" data-tabid="{{ page_ref }}d" role="tab" data-level="advanced">Hybrid Search</a>
+    </div>
+
+
+    {# The AI Pipeline now lives on its own page (guc-0004c); it's no longer a sub-tab here.
+       We keep the partial in the DOM but permanently hidden so the shared runs script still
+       loads the runs and feeds this page's Selection funnel Sankey (via the onRuns hook). #}
+    <section id="tab-semantic" class="subpanel" role="tabpanel" hidden aria-hidden="true">
+      {% set ai_ref = page_ref ~ 'b' %}
+      {% include "_ai_pipeline.html" %}
+    </section>
+
+    <section id="tab-hybrid" class="subpanel" role="tabpanel" data-level="advanced" hidden>
+      <div id="govuk-coverage">
+        <div style="display:flex;justify-content:space-between;align-items:baseline;gap:12px;flex-wrap:wrap;">
+          <h2 style="margin:0;font-size:19px;">Hybrid Search</h2>
+          <span>
+            <a href="#" id="gc-download" style="font-size:14px;" hidden>Download CSV</a>
+            <button type="button" class="btn secondary-btn" id="gc-fetch" style="margin-left:12px;padding:4px 12px;font-size:14px;" hidden>Fetch GOV.UK-only pages</button>
+            <button type="button" class="btn secondary-btn" id="gc-stop" style="margin-left:8px;padding:4px 12px;font-size:14px;color:#d4351c;" hidden>Stop</button>
+          </span>
+        </div>
+        <p class="hint" style="margin-top:2px;">Augments the shortlist using GOV.UK's own Search: it runs the
+          shortlist's keywords through the GOV.UK Search API (scoped to this shortlist's organisations and document types) and tags every
+          page <strong>Shortlister only</strong>, <strong>Both</strong>, or <strong>GOV.UK Search only</strong> — the
+          last are pages our filters missed. <em>Fetch GOV.UK-only pages</em> pulls those into the corpus so the AI
+          Pipeline evaluates them too. This runs automatically each time the shortlist is saved.</p>
+        <div id="gc-threshold-warn" class="gc-warn" hidden></div>
+        <div class="controls" id="gc-controls" style="align-items:center;gap:8px;flex-wrap:wrap;" hidden>
+          <input id="gc-search" type="search" placeholder="Filter titles…" autocomplete="off"
+            style="font:inherit;padding:5px 9px;border:2px solid var(--black);border-radius:6px;min-width:220px;">
+          <span id="gc-summary" class="secondary"></span>
+          <label class="secondary" style="margin-left:auto;font-size:14px;">Show
+            <select id="gc-source" style="font:inherit;padding:3px 6px;border:2px solid var(--black);border-radius:4px;margin-left:4px;">
+              <option value="">All</option>
+              <option value="search">GOV.UK Search only</option>
+              <option value="both">Both</option>
+              <option value="shortlister">Shortlister only</option>
+            </select>
+          </label>
+          <label class="secondary" style="font-size:14px;">Corpus
+            <select id="gc-loaded" style="font:inherit;padding:3px 6px;border:2px solid var(--black);border-radius:4px;margin-left:4px;">
+              <option value="">All</option>
+              <option value="in">In Corpus</option>
+              <option value="missing">Missing From Corpus</option>
+            </select>
+          </label>
+          <label class="secondary" style="font-size:14px;" title="Hide GOV.UK results whose relevance (es_score) is below this. Weak matches (likely false positives) score low.">Min relevance
+            <input id="gc-min-score" type="number" step="0.001" min="0" placeholder="e.g. 0.01"
+              style="font:inherit;width:90px;padding:3px 6px;border:2px solid var(--black);border-radius:4px;margin-left:4px;">
+          </label>
+        </div>
+        <div style="overflow-x:auto;margin-top:8px;">
+          <table id="gc-table" style="font-size:14px;width:100%;">
+            <thead><tr><th>Source</th><th>In corpus</th><th>Title</th><th>Document type</th>
+              <th>Corpus terms</th><th>GOV.UK terms</th><th>Relevance</th><th>URL</th></tr></thead>
+            <tbody id="gc-rows"></tbody>
+          </table>
+        </div>
+        <div id="gc-pager" class="controls" style="margin-top:12px;align-items:center;" hidden>
+          <button class="btn secondary-btn" id="gc-prev" type="button">‹ Prev</button>
+          <span id="gc-range" class="secondary"></span>
+          <button class="btn secondary-btn" id="gc-next" type="button">Next ›</button>
+        </div>
+        <p id="gc-status" class="secondary" style="margin:8px 0 0;"></p>
+        {% if is_admin %}
+        <details id="gc-queries-box" class="sql-details" data-level="advanced" hidden>
+          <summary>Queries sent to the GOV.UK Search API</summary>
+          <pre class="mono sql-pre" id="gc-queries"></pre>
+        </details>
+        {% endif %}
+      </div>
+    </section>
+
+    <span class="pane-id" id="pane-id"></span>
+  </div>
+
+  <p class="secondary" style="margin:22px 0 0;font-size:14px;" data-level="advanced">
+    <a href="{{ url_for('download_audit', cid=category.id) }}">Download Audit File (Debugging only)</a>
+    &nbsp;·&nbsp;
+    <a href="{{ url_for('download_category_bundle', cid=category.id) }}">Download shortlist for a test environment</a>
+    <span class="secondary" style="display:block;margin-top:2px;">Definition, runs, results, membership and
+      metadata-only pages — import in a test system to reproduce and fix this shortlist.</span></p>
+
+  <script src="{{ url_for('static', path='ai_pipeline.js') }}"></script>
+  <script>
+    const CID = {{ category.id }};
+    const STAGES = [{% for s in stages %}"{{ s.stage }}"{{ "," if not loop.last }}{% endfor %}];
+
+    const fmtSecs = ms => (ms / 1000).toFixed(ms < 1000 ? 2 : 1) + "s";
+    const fmtInt  = n => Number(n).toLocaleString();
+    function fmtSize(b) {
+      if (b == null) return "—";
+      if (b < 1024) return b + " B";
+      if (b < 1048576) return (b / 1024).toFixed(0) + " KB";
+      return (b / 1048576).toFixed(1) + " MB";
+    }
+    function esc(s) { const d = document.createElement("div"); d.textContent = s == null ? "" : s; return d.innerHTML; }
+
+    async function timedFetch(url) {
+      const t = performance.now();
+      const r = await fetch(url, { headers: { "Accept": "application/json" } });
+      const j = await r.json();
+      return { j, ms: performance.now() - t };
+    }
+
+    // Funnel: fill one row at a time, timing each.
+    const PREV_STAGE = { org: "all", doctype: "org", keyword: "doctype" };
+    async function runFunnel() {
+      for (const stage of STAGES) {
+        const row = document.querySelector(`#funnel tr[data-stage="${stage}"]`);
+        try {
+          const { j, ms } = await timedFetch(`/api/categories/${CID}/funnel?stage=${stage}`);
+          row.querySelector(".val").textContent = fmtInt(j.count);
+          // 'All pages' is the corpus total — nothing rejected, no query time.
+          row.querySelector(".timing").textContent = stage === "all" ? "—" : fmtSecs(ms);
+          const prev = sankeyCounts[PREV_STAGE[stage]];
+          row.querySelector(".rejected").textContent =
+            stage === "all" || prev == null ? "—" : fmtInt(Math.max(0, prev - j.count));
+          sankeyCounts[stage] = j.count;
+          drawSankey();
+        } catch (e) {
+          row.querySelector(".val").textContent = "error";
+        }
+      }
+      // Hybrid Search coverage loads lazily when its tab is opened (see show()).
+      updateExplainSummary();   // plain-English summary at the top of the tab
+    }
+
+
+    // Render a list of matched keywords as small lozenges (cls = kw-corpus | kw-govuk).
+    function kwLozenges(list, cls) {
+      const arr = Array.isArray(list) ? list : [];
+      if (!arr.length) return `<span class="kw-none">—</span>`;
+      return `<span class="kw-hits">` +
+        arr.map(k => `<span class="kw-hit ${cls}">${esc(k)}</span>`).join("") + `</span>`;
+    }
+    // GOV.UK Search coverage — provenance-tagged augmented shortlist.
+    const GC_PAGE = 50;
+    let gcOffset = 0;
+    let gcQuery = "";   // server-side title filter, applied across the whole stored set
+    const PROV = { search: ["prov-search","GOV.UK Search only"], both: ["prov-both","Both"],
+                   shortlister: ["prov-shortlister","Shortlister only"] };
+    function provLozenge(s){ const p = PROV[s] || ["prov-shortlister", s]; return `<span class="prov ${p[0]}">${esc(p[1])}</span>`; }
+    function loadedLozenge(loaded){ return loaded ? `<span class="ld ld-yes">In Corpus</span>` : `<span class="ld ld-no">Missing From Corpus</span>`; }
+    // Comment header for the expert query box: each configured threshold as BREACHED / not breached.
+    function gcThresholdComments(th) {
+      const yn = b => b ? "BREACHED" : "not breached";
+      const L = [];
+      L.push("-- GOV.UK Search threshold check (does any cap limit the result set below?)");
+      const trunc = (th.phrases_truncated || 0) > 0;
+      L.push(`--   Keyword-phrase limit (GOVUK_MAX_PHRASES=${fmtInt(th.max_phrases)}): ${yn(trunc)}`
+        + ` — ${fmtInt(th.phrases_submitted)} submitted, ${fmtInt(th.phrases_searched)} searched`
+        + (trunc ? `, ${fmtInt(th.phrases_truncated)} skipped` : ""));
+      const capped = (th.capped_phrases || []);
+      L.push(`--   Per-phrase page cap (GOVUK_PER_PHRASE=${fmtInt(th.per_phrase_cap)}): ${yn(capped.length > 0)}`
+        + (capped.length ? ` — capped: ${capped.map(c => `${c.phrase} (${fmtInt(c.total)})`).join(", ")}` : ""));
+      L.push(`--   GOV.UK pagination ceiling (${fmtInt(th.govuk_ceiling)}, GOV.UK's own limit — not configurable): `
+        + yn(capped.some(c => c.total >= th.govuk_ceiling)));
+      L.push(`--   (GOV.UK also caps each request at 100 results; we page through with start= to gather more.)`);
+      L.push(`-- Overall: ${th.any_hit ? "a threshold was hit — coverage may be incomplete." : "no thresholds hit — full result set retrieved."}`);
+      return L.join("\n");
+    }
+    async function loadCoverage() {
+      const tbody = document.getElementById("gc-rows"), status = document.getElementById("gc-status");
+      const source = document.getElementById("gc-source").value;
+      const loaded = document.getElementById("gc-loaded").value;
+      const minScore = document.getElementById("gc-min-score").value || "0";
+      tbody.innerHTML = `<tr><td colspan="8" class="secondary" style="padding:10px 6px;"><span class="spinner"></span> Loading…</td></tr>`;
+      try {
+        const j = await (await fetch(`/api/categories/${CID}/augmented-pages?source=${encodeURIComponent(source)}&loaded=${encodeURIComponent(loaded)}&min_score=${encodeURIComponent(minScore)}&limit=${GC_PAGE}&offset=${gcOffset}&q=${encodeURIComponent(gcQuery)}`)).json();
+        const sum = j.summary || {counts:{}, total:0};
+        const c = sum.counts || {};
+        // Threshold check: warn if a configured cap truncated the GOV.UK result set.
+        const warn = document.getElementById("gc-threshold-warn"), th = sum.thresholds || {};
+        const ran = ("any_hit" in th);   // a comparison has been run, so a threshold verdict exists
+        if (th.any_hit) {
+          const parts = [];
+          if (th.phrases_truncated)
+            parts.push(`${fmtInt(th.phrases_truncated)} keyword phrase(s) beyond the ${fmtInt(th.max_phrases)}-phrase limit were not searched`);
+          if ((th.capped_phrases || []).length) {
+            const names = th.capped_phrases.map(c => `${esc(c.phrase)} (${fmtInt(c.total)})`).join(", ");
+            parts.push(`${fmtInt(th.capped_phrases.length)} phrase(s) had more matches than the ${fmtInt(th.per_phrase_cap)}-page cap: ${names}`);
+          }
+          const raisable = th.per_phrase_cap < th.govuk_ceiling;
+          warn.className = "gc-warn";
+          warn.innerHTML = `⚠ <strong>Coverage may be incomplete</strong> — ${parts.join("; ")}. `
+            + `So a "GOV.UK Search only" gap here may be a threshold limit, not a true search-technique difference. `
+            + (raisable
+                ? `Raise <code>GOVUK_PER_PHRASE</code> / <code>GOVUK_MAX_PHRASES</code> and re-run to confirm.`
+                : `Phrases capped at ${fmtInt(th.govuk_ceiling)} hit GOV.UK's own pagination ceiling (it can't return more).`);
+          warn.hidden = false;
+        } else if (ran) {
+          warn.className = "gc-ok";
+          warn.innerHTML = `✓ <strong>No thresholds were hit</strong> — all ${fmtInt(th.phrases_searched)} keyword phrase(s) were searched `
+            + `and each stayed within the ${fmtInt(th.per_phrase_cap)}-page cap, so the GOV.UK result set was retrieved in full. `
+            + `Any "GOV.UK Search only" gap here is a true search-technique difference, not a threshold limit.`;
+          warn.hidden = false;
+        } else { warn.hidden = true; }
+        // Admin-only: the exact GOV.UK Search API queries we sent, with a threshold header.
+        // The box only renders for admins (is_admin gate), so guard against it being absent.
+        const qbox = document.getElementById("gc-queries-box"), qpre = document.getElementById("gc-queries");
+        const queries = sum.query_urls || [];
+        if (qbox && qpre && queries.length) {
+          const header = ran ? gcThresholdComments(th) + "\n\n" : "";
+          qpre.textContent = header + queries.map(q => (q && q.url != null)
+            ? `-- ${q.comment || ""}\n${q.url}` : String(q)).join("\n\n");
+          qbox.hidden = false;
+        } else if (qbox) { qbox.hidden = true; }
+        if (!sum.total) {
+          document.getElementById("gc-controls").hidden = true;
+          document.getElementById("gc-download").hidden = true;
+          document.getElementById("gc-pager").hidden = true;
+          tbody.innerHTML = `<tr><td colspan="8" class="secondary" style="padding:10px 6px;">Not run yet — save the shortlist to run the GOV.UK hybrid search.</td></tr>`;
+          status.textContent = ""; return;
+        }
+        document.getElementById("gc-controls").hidden = false;
+        document.getElementById("gc-download").hidden = false;
+        const pending = sum.pending_fetch || 0, evaluable = sum.evaluable || 0;
+        const fetchBtn = document.getElementById("gc-fetch");
+        fetchBtn.hidden = pending === 0;
+        fetchBtn.textContent = `Fetch ${fmtInt(pending)} GOV.UK-only page${pending === 1 ? "" : "s"}`;
+        document.getElementById("gc-summary").innerHTML =
+          `${provLozenge("shortlister")} ${fmtInt(c.shortlister||0)} · ${provLozenge("both")} ${fmtInt(c.both||0)} · `
+          + `${provLozenge("search")} ${fmtInt(c.search||0)}`
+          + ` <span class="secondary">· ${fmtInt(evaluable)} GOV.UK-only in corpus (evaluable)`
+          + (pending ? `, ${fmtInt(pending)} to fetch` : "")
+          + (sum.computed_at ? ` · as of ${esc(String(sum.computed_at).slice(0,16).replace("T"," "))}` : "") + `</span>`;
+        const rows = j.rows || [], total = j.total;
+        tbody.innerHTML = rows.length ? rows.map(r =>
+          `<tr>` +
+            `<td>${provLozenge(r.source)}</td>` +
+            `<td>${loadedLozenge(r.loaded)}</td>` +
+            `<td><a href="${esc(r.url)}">${esc(r.title || r.url)}</a></td>` +
+            `<td>${esc(r.document_type || "—")}</td>` +
+            `<td>${kwLozenges(r.corpus_keywords, "kw-corpus")}</td>` +
+            `<td>${kwLozenges(r.govuk_keywords, "kw-govuk")}</td>` +
+            `<td class="mono" style="font-variant-numeric:tabular-nums;white-space:nowrap;">${r.es_score == null ? '<span class="kw-none">—</span>' : Number(r.es_score).toFixed(4)}</td>` +
+            `<td><a href="${esc(r.url)}" class="mono" style="font-size:13px;">${esc(r.url)}</a></td>` +
+          `</tr>`).join("") : `<tr><td colspan="8" class="secondary" style="padding:10px 6px;">No pages for this filter.</td></tr>`;
+        const from = rows.length ? gcOffset + 1 : 0, to = gcOffset + rows.length;
+        document.getElementById("gc-range").textContent = `${fmtInt(from)}–${fmtInt(to)} of ${fmtInt(total)}`;
+        document.getElementById("gc-prev").disabled = gcOffset <= 0;
+        document.getElementById("gc-next").disabled = gcOffset + GC_PAGE >= total;
+        document.getElementById("gc-pager").hidden = total <= GC_PAGE;
+        document.getElementById("gc-download").href = `/categories/${CID}/augmented/download`;
+        status.textContent = "";
+      } catch (e) { tbody.innerHTML = ""; status.textContent = "Could not load the coverage list."; }
+    }
+    // Hybrid search runs as a background job (it can take minutes at the 10k/phrase limit):
+    // start it, then poll for progress and reload the list when it finishes.
+    let gcPollTimer = null;
+    function gcHybridMessage(s) {
+      if (s.phase === "searching")
+        return `Searching GOV.UK… ${fmtInt(s.phrases_done || 0)}/${fmtInt(s.phrases_total || 0)} phrases, ${fmtInt(s.pages || 0)} pages found`;
+      if (s.phase === "fetching")
+        return `Fetching GOV.UK-only pages into the corpus… ${fmtInt(s.fetched || 0)} fetched`
+             + (s.pending != null ? `, ${fmtInt(s.pending)} to go` : "");
+      return "Working…";
+    }
+    async function gcPoll() {
+      const status = document.getElementById("gc-status");
+      let s;
+      try { s = await (await fetch(`/api/categories/${CID}/hybrid-bg/status`)).json(); }
+      catch (e) { return; }
+      if (s.running) {
+        status.style.color = "";
+        document.getElementById("gc-stop").hidden = false;
+        status.innerHTML = '<span class="spinner"></span> ' + esc(gcHybridMessage(s));
+        if (!gcPollTimer) gcPollTimer = setInterval(gcPoll, 3000);
+      } else {
+        if (gcPollTimer) { clearInterval(gcPollTimer); gcPollTimer = null; }
+        document.getElementById("gc-stop").hidden = true;
+        if (s.error) { status.style.color = "var(--red,#d4351c)"; status.textContent = "Error: " + s.error; }
+        else if (s.finished_at) {
+          status.style.color = "";
+          status.textContent = `Done — ${fmtInt(s.fetched || 0)} GOV.UK-only page(s) fetched`
+            + (s.evaluable != null ? `, ${fmtInt(s.evaluable)} evaluable.` : ".");
+        }
+        gcOffset = 0; await loadCoverage();
+      }
+    }
+    document.getElementById("gc-stop").addEventListener("click", async () => {
+      document.getElementById("gc-stop").disabled = true;
+      try { await fetch(`/api/categories/${CID}/hybrid-bg/stop`, { method: "POST" }); } catch (e) {}
+      document.getElementById("gc-stop").disabled = false;
+      document.getElementById("gc-status").textContent = "Stopping after the current batch…";
+    });
+    document.getElementById("gc-fetch").addEventListener("click", async () => {
+      const btn = document.getElementById("gc-fetch"), status = document.getElementById("gc-status");
+      btn.disabled = true; const label = btn.textContent; btn.textContent = "Fetching…";
+      status.style.color = ""; status.innerHTML = '<span class="spinner"></span> Fetching GOV.UK-only pages into the corpus…';
+      try {
+        const r = await fetch(`/api/categories/${CID}/govuk-fetch`, { method: "POST" });
+        const j = await r.json().catch(() => ({}));
+        if (!r.ok || j.error) throw new Error(j.error || ("HTTP " + r.status));
+        status.textContent = `Fetched ${fmtInt(j.fetched||0)} page(s); ${fmtInt(j.evaluable||0)} now evaluable`
+          + (j.pending ? `, ${fmtInt(j.pending)} still to fetch (click again).` : ".");
+        await loadCoverage();
+      } catch (e) { status.style.color = "var(--red,#d4351c)"; status.textContent = "Error: " + (e.message || e); }
+      finally { btn.disabled = false; btn.textContent = label; }
+    });
+    document.getElementById("gc-source").addEventListener("change", () => { gcOffset = 0; loadCoverage(); });
+    document.getElementById("gc-loaded").addEventListener("change", () => { gcOffset = 0; loadCoverage(); });
+    let gcScoreTimer = null;
+    document.getElementById("gc-min-score").addEventListener("input", () => {
+      clearTimeout(gcScoreTimer);
+      gcScoreTimer = setTimeout(() => { gcOffset = 0; loadCoverage(); }, 300);
+    });
+    // Type-ahead title filter — debounced, filters the whole stored set server-side.
+    let gcSearchTimer = null;
+    document.getElementById("gc-search").addEventListener("input", (e) => {
+      const v = e.target.value;
+      clearTimeout(gcSearchTimer);
+      gcSearchTimer = setTimeout(() => { gcQuery = v.trim(); gcOffset = 0; loadCoverage(); }, 250);
+    });
+    document.getElementById("gc-prev").addEventListener("click", () => { gcOffset = Math.max(0, gcOffset - GC_PAGE); loadCoverage(); });
+    document.getElementById("gc-next").addEventListener("click", () => { gcOffset += GC_PAGE; loadCoverage(); });
+
+
+    // Log-scaled pipeline Sankey: deterministic funnel (organisation → document
+    // type → shortlist) plus the LLM inclusion/exclusion passes once a run exists.
+    // A log scale keeps single-digit stages visible beside corpus-sized ones; at
+    // each split the parent band is divided in proportion to the log-sized children
+    // (so log(a+b) ≠ log(a)+log(b) doesn't leave gaps). Widths are indicative.
+    let sankeyLLM = null;   // {inclKept, inclDropped, exclKept, exclDropped} or null
+    let govukAdd = 0;       // GOV.UK-Search pages added on top of the keyword shortlist (this run)
+    const sankeyCounts = {};
+
+    // The AI evaluated keyword-shortlist + GOV.UK-Search additions; the additions = what the AI
+    // actually took in (inclusion kept + dropped) minus the keyword count, so the funnel reconciles.
+    function updateGovukRow() {
+      const row = document.getElementById("funnel-govuk");
+      if (!row) return;
+      const kw = sankeyCounts.keyword;
+      const aiInput = sankeyLLM ? (Number(sankeyLLM.inclKept || 0) + Number(sankeyLLM.inclDropped || 0)) : null;
+      govukAdd = (kw != null && aiInput != null) ? Math.max(0, aiInput - kw) : 0;
+      if (govukAdd > 0) { row.hidden = false; document.getElementById("govuk-val").textContent = "+" + fmtInt(govukAdd); }
+      else { row.hidden = true; }
+    }
+    // Plain-English outcome line: composed from whatever numbers have loaded so far (the
+    // deterministic funnel counts, then the AI run once it arrives). Called after runFunnel()
+    // and after loadRuns().
+    function updateExplainSummary() {
+      const el = document.getElementById("explain-outcome");
+      if (!el) return;
+      const all = sankeyCounts["all"], matched = sankeyCounts["keyword"];
+      const parts = [];
+      if (matched == null) { el.textContent = "Working out the numbers…"; return; }
+      if (all != null)
+        parts.push(`Of about ${fmtInt(all)} pages in the corpus, the filters keep <strong>${fmtInt(matched)}</strong> that match.`);
+      else
+        parts.push(`The filters keep <strong>${fmtInt(matched)}</strong> matching pages.`);
+      if (sankeyLLM && sankeyLLM.exclKept != null)
+        parts.push(`The AI then reviewed those — keeping ${fmtInt(sankeyLLM.inclKept)} as relevant and removing edge cases — for a final shortlist of <strong>${fmtInt(sankeyLLM.exclKept)}</strong>.`);
+      else if (sankeyLLM)
+        parts.push(`The AI then reviewed those and kept <strong>${fmtInt(sankeyLLM.inclKept)}</strong> for the shortlist.`);
+      else
+        parts.push(`No AI review has run yet, so the shortlist is these <strong>${fmtInt(matched)}</strong> keyword-matched pages.`);
+      el.innerHTML = parts.join(" ");
+    }
+    function drawSankey() {
+      updateGovukRow();
+      const svg = document.getElementById("sankey");
+      if (!svg || ["org", "doctype", "keyword"].some(k => sankeyCounts[k] == null)) return;
+      const BLUE = "#1d70b8", PURPLE = "#4c2c92", GREEN = "#00703c", RED = "#d4351c", ORANGE = "#f47738", GREY = "#b1b4b6", TEAL = "#12b6c9";
+      const dropDoc = Math.max(0, sankeyCounts.org - sankeyCounts.doctype);
+      const dropKw = Math.max(0, sankeyCounts.doctype - sankeyCounts.keyword);
+      const nodes = [
+        { key:"org",       col:0, band:"main", name:"Matched Orgs",      val:sankeyCounts.org,     color:BLUE },
+        { key:"dropDoc",   col:1, band:"up",   name:"Wrong Doc Type",    val:dropDoc,              color:GREY },
+        { key:"doctype",   col:1, band:"main", name:"Matched Doc Type",  val:sankeyCounts.doctype, color:PURPLE },
+        { key:"dropKw",    col:2, band:"up",   name:"No Keywords",       val:dropKw,               color:GREY },
+        { key:"shortlist", col:2, band:"main", name:"Contains Keywords", val:sankeyCounts.keyword, color:BLUE },
+      ];
+      const links = [
+        { s:"org", t:"doctype" }, { s:"org", t:"dropDoc", top:true },
+        { s:"doctype", t:"shortlist" }, { s:"doctype", t:"dropKw", top:true },
+      ];
+      if (sankeyLLM) {
+        nodes.push({ key:"drop1", col:3, band:"up",   name:"Excluded by AI", val:sankeyLLM.inclDropped, color:RED });
+        nodes.push({ key:"incl",  col:3, band:"main", name:"Included by AI",  val:sankeyLLM.inclKept, color:PURPLE });
+        links.push({ s:"shortlist", t:"drop1", top:true }, { s:"shortlist", t:"incl" });
+        if (govukAdd > 0) {          // GOV.UK-Search additions flow into the AI input alongside the shortlist
+          nodes.push({ key:"govuk", col:2, band:"down", name:"+GOV.UK", val:govukAdd, color:TEAL });
+          links.push({ s:"govuk", t:"drop1", top:true }, { s:"govuk", t:"incl" });
+        }
+        if (sankeyLLM.exclKept != null) {
+          nodes.push({ key:"drop2", col:4, band:"up",   name:"Excluded by AI-Judge", val:sankeyLLM.exclDropped, color:ORANGE });
+          nodes.push({ key:"excl",  col:4, band:"main", name:"Shortlist", val:sankeyLLM.exclKept, color:GREEN });
+          links.push({ s:"incl", t:"drop2", top:true }, { s:"incl", t:"excl" });
+        }
+      }
+      const byKey = {}; nodes.forEach(n => byKey[n.key] = n);
+      const maxCol = Math.max(...nodes.map(n => n.col));
+      const W = svg.clientWidth || 900, nw = 13;
+      const maxVal = Math.max(...nodes.map(n => n.val || 1));
+      // Height transform: a power law (exponent < 1) sits between log (→0) and
+      // linear (1). Heights are anchored to one scale — the largest node is the
+      // reference (MAX_H) and every other node is a fraction of it, so a bigger
+      // count is always a taller bar (right side never taller than the left).
+      // ~0.45 gives a clear left-to-right funnel taper; MIN_H keeps tiny stages
+      // (e.g. a handful of dropped pages) visible. Raise P toward 1 for a stronger
+      // taper, lower it toward 0 for flatter/more even bars.
+      const P = 0.45, MAX_H = 150, MIN_H = 14;
+      const tf = v => Math.pow(Math.max(1, v || 1), P);
+      const K = MAX_H / tf(maxVal);
+      const hOf = v => Math.max(MIN_H, K * tf(v));
+      const midY = 190, upY = 74, downY = 262, padL = 112, padR = 124;
+      const colGap = (W - padL - padR - nw) / Math.max(1, maxCol);
+      nodes.forEach(n => {
+        n.h = hOf(n.val); n.x = padL + n.col * colGap;
+        n.cy = n.band === "up" ? upY : (n.band === "down" ? downY : midY);
+        n.yTop = n.cy - n.h / 2; n.yBot = n.cy + n.h / 2;
+      });
+      const lastMain = nodes.filter(n => n.band === "main").slice(-1)[0];
+      // Partition each source node's right edge among its outgoing links (dropped on top).
+      const outgoing = {};
+      links.forEach(l => (outgoing[l.s] = outgoing[l.s] || []).push(l));
+      Object.keys(outgoing).forEach(sk => {
+        const s = byKey[sk], outs = outgoing[sk];
+        outs.sort((a, b) => (b.top ? 1 : 0) - (a.top ? 1 : 0));
+        const totalH = outs.reduce((a, l) => a + byKey[l.t].h, 0);
+        let y = s.yTop;
+        outs.forEach(l => { const seg = s.h * (byKey[l.t].h / totalH); l.sy0 = y; l.sy1 = y + seg; y += seg; });
+      });
+      const escT = s => String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;");
+      let out = "";
+      links.forEach(l => {
+        const s = byKey[l.s], t = byKey[l.t], x0 = s.x + nw, x1 = t.x, mx = (x0 + x1) / 2;
+        const sy0 = l.sy0 != null ? l.sy0 : s.yTop, sy1 = l.sy1 != null ? l.sy1 : s.yBot;
+        out += `<path d="M${x0},${sy0} C${mx},${sy0} ${mx},${t.yTop} ${x1},${t.yTop} `
+             + `L${x1},${t.yBot} C${mx},${t.yBot} ${mx},${sy1} ${x0},${sy1} Z" `
+             + `fill="${s.color}" fill-opacity="0.32"/>`;
+      });
+      nodes.forEach(n => { out += `<rect x="${n.x}" y="${n.yTop}" width="${nw}" height="${n.h}" rx="1.5" fill="${n.color}"/>`; });
+      function label(n, pos) {
+        // Wrap every label on spaces (one word per line) and render all text bold.
+        const lines = n.name.split(" ").map(t => ({ t, b:false }));
+        lines.push({ t: (n.val || 0).toLocaleString(), b:true });
+        const lh = 13; let x, anchor, startY;
+        if (pos === "left")  { x = n.x - 8;      anchor = "end";    startY = n.cy - ((lines.length-1)/2)*lh + 4; }
+        if (pos === "right") { x = n.x + nw + 8; anchor = "start";  startY = n.cy - ((lines.length-1)/2)*lh + 4; }
+        if (pos === "above") { x = n.x + nw/2;   anchor = "middle"; startY = n.yTop - 8 - (lines.length-1)*lh; }
+        return lines.map((ln, i) => {
+          const fill = ln.b ? "#0b0c0c" : "#505a5f";
+          return `<text x="${x}" y="${startY + i*lh}" font-size="11" text-anchor="${anchor}" `
+               + `fill="${fill}" font-weight="700">${escT(ln.t)}</text>`;
+        }).join("");
+      }
+      nodes.forEach(n => { out += label(n, n.band === "up" ? "above" : (n === lastMain ? "right" : "left")); });
+      svg.innerHTML = out;
+    }
+    window.addEventListener("resize", drawSankey);
+
+    function fmtDate(s) { return s ? String(s).slice(0, 19).replace("T", " ") : "—"; }
+    // Wall-clock elapsed between start and finish as H:MM:SS ("—" if unfinished).
+    function fmtElapsed(startIso, finishIso) {
+      if (!startIso || !finishIso) return "—";
+      let s = Math.round((new Date(finishIso) - new Date(startIso)) / 1000);
+      if (!isFinite(s) || s < 0) return "—";
+      const h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60), sec = s % 60;
+      return `${h}:${String(m).padStart(2, "0")}:${String(sec).padStart(2, "0")}`;
+    }
+
+    // AI Pipeline runs UI (loadRuns, execute/stop/complete controls, active-run summary, run
+    // history, background polling) lives in the shared /static/ai_pipeline.js, driven via
+    // window.AIPipeline. The pipeline is its own page now; its partial stays hidden here only
+    // so loadRuns still fires and feeds this page's funnel Sankey via the onRuns hook.
+
+    function fillFunnelAiRow(stage, run) {
+      const row = document.querySelector(`#funnel tr[data-stage="${stage}"]`);
+      if (!row) return;
+      if (!run) { row.hidden = true; return; }
+      row.hidden = false;
+      row.querySelector(".val").textContent = fmtInt(run.kept || 0);
+      row.querySelector(".rejected").textContent = fmtInt(run.dropped || 0);
+      row.querySelector(".timing").textContent = fmtElapsed(run.started_at, run.finished_at);
+    }
+
+
+    // ---- AI Pipeline: shared /static/ai_pipeline.js drives the runs UI (execute/stop/complete,
+    // runs table, active-run summary, background polling, nested Active-Run/Run-History tabs).
+    // These hooks feed this page's extras — the funnel Sankey — as the shared script
+    // (re)loads runs and polls a background run.
+    function aiOnRuns(j) {
+      // Feed the latest inclusion (and its exclusion) run into the pipeline Sankey.
+      const incl = j.runs.find(r => /inclusion/i.test(r.phase || ""));
+      const excl = incl && j.runs.find(r => /exclusion/i.test(r.phase || "") && r.source_run_id === incl.run_id);
+      sankeyLLM = incl ? {
+        inclKept: incl.kept || 0, inclDropped: incl.dropped || 0,
+        exclKept: excl ? (excl.kept || 0) : null, exclDropped: excl ? (excl.dropped || 0) : null,
+      } : null;
+      fillFunnelAiRow("incl", incl);
+      fillFunnelAiRow("excl", excl);
+      drawSankey();
+      updateExplainSummary();
+    }
+    window.AIPipeline.init(CID, { onRuns: aiOnRuns });
+
+    // Only Hybrid Search remains here (Keyword Matching moved to its own pipeline tab; the AI
+    // Pipeline partial stays hidden above only to feed the Sankey). Open Hybrid Search when it's
+    // visible for this display level (it is advanced-only); otherwise show just the funnel.
+    (function () {
+      const btns = document.querySelectorAll(".subtab");
+      function show(tab) {
+        btns.forEach(b => b.classList.toggle("current", b.dataset.tab === tab));
+        const hy = document.getElementById("tab-hybrid");
+        if (hy) hy.hidden = tab !== "hybrid";
+        const active = [...btns].find(b => b.dataset.tab === tab);
+        document.getElementById("pane-id").textContent = active ? active.dataset.tabid : "";
+        if (tab === "hybrid") gcPoll();   // lazy: loads the list, or resumes progress if a job is running
+        try { localStorage.setItem("preview-subtab-" + CID, tab); } catch (e) {}
+      }
+      btns.forEach(b => b.addEventListener("click", e => { e.preventDefault(); show(b.dataset.tab); }));
+      const hyBtn = [...btns].find(b => b.dataset.tab === "hybrid");
+      if (hyBtn && hyBtn.offsetParent !== null) show("hybrid");
+    })();
+
+    // Refresh: clear the cached counts server-side, reset the rows, and re-run.
+    document.getElementById("refresh-funnel").addEventListener("click", async e => {
+      const btn = e.currentTarget;
+      btn.disabled = true;
+      try {
+        await fetch(`/api/categories/${CID}/funnel/refresh`, { method: "POST" });
+        document.querySelectorAll("#funnel .val").forEach(v => v.innerHTML = '<span class="spinner"></span>');
+        document.querySelectorAll("#funnel .timing").forEach(t => t.textContent = "");
+        Object.keys(sankeyCounts).forEach(k => delete sankeyCounts[k]);
+        await runFunnel();   // re-fetches every stage (now cache misses) + reloads the breakdowns
+      } finally { btn.disabled = false; }
+    });
+
+    runFunnel();  // fills the funnel table and draws the Sankey
+  </script>
+{% endblock %}

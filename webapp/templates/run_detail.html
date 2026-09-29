@@ -1,0 +1,560 @@
+{% extends "base.html" %}
+{% block page_id %}guc-0006{% endblock %}
+{% block title %}Run Details for {{ run.name or run.run_id }}{% endblock %}
+{% block content %}
+  {% macro notelist(items) %}
+  <ul style="list-style:none;padding:0;margin:0 0 18px;max-width:840px;">
+    {% for n in items %}
+    <li style="padding:9px 13px;margin:0 0 6px;font-size:15px;border-radius:0 5px 5px 0;background:var(--surface-2);
+      border-left:4px solid {{ {'ok':'var(--green)','warn':'var(--red,#d4351c)','info':'var(--border-mid)'}[n.kind] }};">{{ n.text }}</li>
+    {% endfor %}
+  </ul>
+  {% endmacro %}
+
+  <a class="back" href="{{ url_for('ai_pipeline_page', cid=category.id) }}">‹ Back to Runs</a>
+  {% if is_admin %}<a class="back" style="margin-left:18px;" href="{{ url_for('gold_page', cid=category.id) }}?run={{ (chain[0].run_id if chain else run.run_id) }}">Label gold from this run ›</a>{% endif %}
+  <div style="display:flex;align-items:center;justify-content:space-between;gap:16px;flex-wrap:wrap;margin:18px 0 4px;">
+    <h1 id="run-title" style="margin:0;">Run Details for {{ run.name or run.run_id }}</h1>
+    <div style="display:flex;gap:10px;flex-wrap:wrap;">
+      <a class="btn secondary-btn" style="white-space:nowrap;" href="{{ url_for('rebuild_category_page', cid=category.id) }}" title="Re-apply the saved Filter Parameters: rebuild the shortlist (organisation, document type, keyword) and reconcile the results, then return here">↻ Refresh shortlist</a>
+      <a class="btn" style="white-space:nowrap;" href="{{ url_for('download_page', cid=category.id) }}?run={{ (chain[0].run_id if chain else run.run_id) }}&amp;stage=final" title="Download this run's final shortlist (choose columns/format on the download page)">Download this run</a>
+    </div>
+  </div>
+  <p class="secondary" style="margin:0 0 18px;">{{ category.display_name }}
+    (<span class="mono">{{ category.slug or '' }}</span>) · run <span class="mono">{{ run.run_id }}</span></p>
+
+  <div class="field" style="max-width:520px;">
+    <label class="q" for="run-name">Run name</label>
+    <div class="controls" style="margin:0;align-items:center;">
+      <input id="run-name" type="text" value="{{ run.name or '' }}" style="min-width:280px;">
+      <button class="btn secondary-btn" id="save-name" type="button">Save name</button>
+      <span id="name-status" class="secondary"></span>
+    </div>
+  </div>
+
+  {# Run outcome — one-glance answer to "what happened / what failed / why it didn't finish". #}
+  {% set _oc = {'good': '#00703c', 'warn': '#f47738', 'bad': '#d4351c', 'muted': '#6f777b'} %}
+  <div style="margin:14px 0 0;padding:12px 16px;border-left:4px solid {{ _oc[outcome.kind] }};
+    background:var(--surface-2);border-radius:0 6px 6px 0;max-width:840px;">
+    <div style="display:flex;align-items:baseline;gap:12px;flex-wrap:wrap;">
+      <span style="font-weight:700;font-size:16px;color:{{ _oc[outcome.kind] }};">
+        {% if outcome.kind == 'good' %}✅{% elif outcome.kind == 'bad' %}⛔{% elif outcome.kind == 'warn' %}⚠{% else %}○{% endif %} {{ outcome.label }}
+      </span>
+      <span class="secondary" style="font-size:13px;">
+        Started {{ (run.started_at or '')[:19]|replace('T',' ') or '—' }}{% if run.finished_at %}
+        · Finished {{ run.finished_at[:19]|replace('T',' ') }}{% endif %}{% if run.run_status %}
+        · status <span class="mono">{{ run.run_status }}</span>{% endif %}
+      </span>
+    </div>
+    {% if outcome.why %}<p style="margin:8px 0 0;font-size:14px;"><strong>Why it didn't complete:</strong> {{ outcome.why }}</p>{% endif %}
+    <p style="margin:8px 0 0;font-size:14px;"><strong>What failed:</strong>
+      {% if outcome.unparsed or outcome.truncated %}
+        {% if outcome.unparsed %}<a href="#not-parsed">{{ outcome.unparsed }} repl{{ 'y' if outcome.unparsed == 1 else 'ies' }} couldn't be parsed</a>{% endif %}{% if outcome.unparsed and outcome.truncated %} · {% endif %}
+        {% if outcome.truncated %}{{ outcome.truncated }} repl{{ 'y' if outcome.truncated == 1 else 'ies' }} cut off at the token limit{% endif %}.
+      {% else %}None — every evaluated page returned a usable verdict.{% endif %}
+    </p>
+  </div>
+  {% if run_trial and (run_trial.prompt_variant != 'current' or run_trial.concurrency > 1 or run_trial.caching) %}
+  <p class="secondary" data-level="advanced" style="margin:0 0 6px;">
+    <span style="font-weight:700;">Trial (A/B):</span>
+    prompt <span class="mono">{{ run_trial.prompt_variant }}</span>
+    · concurrency <span class="mono">{{ run_trial.concurrency }}×</span>
+    · caching <span class="mono">{{ 'on' if run_trial.caching else 'off' }}</span>
+  </p>
+  {% endif %}
+
+  {# Live status: shown only while a background evaluation for this run's lineage is
+     in progress. Populated by JS polling evaluate-bg/status; auto-refreshes on finish. #}
+  <div id="run-live" hidden style="margin:12px 0 0;padding:10px 14px;border-left:4px solid var(--blue);
+    background:var(--panel-blue);border-radius:0 5px 5px 0;max-width:840px;font-size:15px;">
+    <span class="spinner" id="run-live-spin"></span> <span id="run-live-text">Checking…</span>
+  </div>
+
+  {% if run_state != 'complete' %}
+  <p style="margin:12px 0 0;">
+    {% if run_state == 'fresh' %}
+    <button class="btn" id="complete-run" type="button" data-fresh="1">Start Run</button>
+    {% else %}
+    <button class="btn" id="complete-run" type="button">Complete run</button>
+    {% endif %}
+    <span id="complete-status" class="secondary" style="margin-left:10px;"></span>
+  </p>
+  <p class="hint" style="margin:6px 0 0;">
+    {% if run_state == 'fresh' %}Give the run a name (more than 3 characters) above, then Start Run. It runs on the
+      server in the background — you can leave this page and come back.
+    {% else %}{{ continue_reason }} Continues the unfinished phase on the server (in the background) so that
+      input = kept + dropped — you can close this page and come back.{% endif %}</p>
+  {% else %}
+  <p class="secondary" style="margin:12px 0 0;">✅ Evaluation complete — every phase reconciles (input = kept + dropped).</p>
+  {% endif %}
+
+  <h2 style="margin-top:26px;">Next steps</h2>
+  {{ notelist(commentary.next_steps) }}
+
+  <h2 style="margin-top:26px;">LLM phases</h2>
+  <p class="hint">Each phase of this evaluation (inclusion → exclusion), the model used, and its tokens and cost.
+    Phases share one lineage; the row for the run you opened is highlighted.</p>
+
+  <div class="table-wrap">
+    <table style="font-size:14px;">
+      <thead><tr>
+        <th>Phase</th><th>Supplier</th><th>Model</th>
+        <th class="num">Pages</th><th class="num">Keep</th><th class="num">Drop</th>
+        <th class="num">Tokens in</th><th class="num">Tokens out</th>
+        <th class="num">Cache hit</th><th class="num">Cache miss</th>
+        <th class="num">Cost (USD)</th><th class="num">Avg (s)</th>
+      </tr></thead>
+      <tbody>
+        {% for r in chain %}
+        <tr {% if r.run_id == run.run_id %}style="background:var(--surface-3);font-weight:600;"{% endif %}>
+          <td>{{ r.phase or '—' }}</td>
+          <td>{{ r.provider or '—' }}</td>
+          <td class="mono">{{ r.actual_model or r.model or '—' }}</td>
+          <td class="num">{{ '{:,}'.format(r.pages or 0) }}</td>
+          <td class="num">{{ '{:,}'.format(r.kept or 0) }}</td>
+          <td class="num">{{ '{:,}'.format(r.dropped or 0) }}</td>
+          <td class="num">{{ '{:,}'.format(r.in_tokens or 0) }}</td>
+          <td class="num">{{ '{:,}'.format(r.out_tokens or 0) }}</td>
+          <td class="num">{{ '{:,}'.format(r.hit_tokens or 0) }}</td>
+          <td class="num">{{ '{:,}'.format(r.miss_tokens or 0) }}</td>
+          <td class="num">${{ '%.2f'|format(r.cost or 0) }}</td>
+          <td class="num">{{ '%.1f'|format((r.total_ms or 0) / r.pages / 1000) if r.pages else '—' }}</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+      {% if chain|length > 1 %}
+      <tfoot><tr style="font-weight:700;border-top:2px solid var(--border-mid);">
+        <td colspan="3">Total ({{ chain|length }} phases)</td>
+        <td class="num">{{ '{:,}'.format(totals.pages) }}</td>
+        <td class="num"></td><td class="num"></td>
+        <td class="num">{{ '{:,}'.format(totals.in_tokens) }}</td>
+        <td class="num">{{ '{:,}'.format(totals.out_tokens) }}</td>
+        <td class="num">{{ '{:,}'.format(totals.hit_tokens) }}</td>
+        <td class="num">{{ '{:,}'.format(totals.miss_tokens) }}</td>
+        <td class="num">${{ '%.2f'|format(totals.cost) }}</td>
+        <td class="num"></td>
+      </tr></tfoot>
+      {% endif %}
+    </table>
+  </div>
+
+  {# Per-page results: every page this run scored, with the inclusion pass's grounding fields
+     (primary topic / matched-in / verbatim evidence). Loaded from the run's results API. #}
+  <h2 style="margin-top:30px;">Per-page results</h2>
+  <p class="hint" style="max-width:860px;">Every page this run scored, with the inclusion pass's grounding:
+    the <strong>primary topic</strong> (what the page is mainly about), where the topic was
+    <strong>matched in</strong> (title, description, body) and the <strong>evidence</strong> quotes copied
+    verbatim from the page. On an exclusion run these come from its inclusion run.</p>
+  <div class="controls" style="align-items:center;gap:10px;flex-wrap:wrap;margin:0 0 8px;">
+    <label class="secondary" style="font-size:14px;">Show
+      <select id="pr-filter" style="font:inherit;padding:3px 6px;border:2px solid var(--black);border-radius:4px;margin-left:4px;">
+        <option value="">All</option><option value="1">Kept</option><option value="0">Dropped</option>
+      </select></label>
+    <label class="secondary" style="font-size:14px;">Per page
+      <select id="pr-page-size" style="font:inherit;padding:3px 6px;border:2px solid var(--black);border-radius:4px;margin-left:4px;">
+        <option value="20" selected>20</option><option value="100">100</option><option value="all">All</option>
+      </select></label>
+    <span id="pr-summary" class="secondary"></span>
+  </div>
+  <div class="table-wrap">
+    <table id="pr-table" style="font-size:13px;">
+      <thead><tr>
+        <th>Page</th><th>Verdict</th><th class="num">Score</th><th>Confidence</th>
+        <th>Primary topic</th><th>Matched in</th><th>Evidence</th><th>Reason</th>
+      </tr></thead>
+      <tbody><tr><td colspan="8" class="secondary" style="padding:10px 6px;"><span class="spinner"></span></td></tr></tbody>
+    </table>
+  </div>
+  <div id="pr-pager" class="controls" style="align-items:center;gap:12px;margin-top:10px;" hidden>
+    <button class="btn secondary-btn" id="pr-prev" type="button" style="padding:5px 12px;">‹ Prev</button>
+    <span id="pr-range" class="secondary"></span>
+    <button class="btn secondary-btn" id="pr-next" type="button" style="padding:5px 12px;">Next ›</button>
+  </div>
+
+  <h2 style="margin-top:30px;">Run commentary</h2>
+  <p class="hint">An automatic read of this run's phases — what has run, any errors, and whether each phase's
+    output reconciles with its input (input = kept + dropped, allowing for unparseable replies).</p>
+
+  <h3 style="margin:16px 0 6px;">What has run</h3>
+  {{ notelist(commentary.phases) }}
+
+  <h3 style="margin:16px 0 6px;">Errors</h3>
+  {% if commentary.errors %}{{ notelist(commentary.errors) }}
+  {% else %}<p class="secondary" style="margin:0 0 18px;">None — no unparseable replies, and every phase shown has finished.</p>{% endif %}
+
+  <h3 style="margin:16px 0 6px;">Input vs output</h3>
+  {% if commentary.reconcile %}{{ notelist(commentary.reconcile) }}
+  {% else %}<p class="secondary" style="margin:0 0 18px;">Shortlist total unavailable, so input/output couldn't be reconciled.</p>{% endif %}
+
+  <h2 id="not-parsed" style="margin-top:30px;">Not parsed</h2>
+  {% if unparsed %}
+  <p class="hint">The {{ unparsed|length }} page{{ '' if unparsed|length == 1 else 's' }} below returned a model
+    reply that couldn't be parsed, so {{ 'it was' if unparsed|length == 1 else 'they were' }} left unscored
+    (neither kept nor dropped).</p>
+  <p style="margin:0 0 14px;display:flex;align-items:center;gap:12px;flex-wrap:wrap;">
+    <button type="button" class="btn" id="retry-unparsable"
+      title="Re-ask the model for these pages, in this run's own phases, with exponential backoff on transient errors (e.g. rate limits). Uses API credit.">Reprocess failed rows</button>
+    <span id="retry-status" class="secondary"></span>
+  </p>
+  <div class="table-wrap">
+    <table style="font-size:14px;">
+      <thead><tr><th>Phase</th><th>Page</th><th>Reason</th><th>Raw model reply</th></tr></thead>
+      <tbody>
+        {% for u in unparsed %}
+        <tr>
+          <td>{{ u.phase or '—' }}</td>
+          <td><a href="{{ u.url }}" target="_blank" rel="noopener">{{ u.url }}</a></td>
+          <td class="secondary">{{ u.reason or 'unparseable model reply' }}</td>
+          <td class="secondary">
+            {% if u.raw_reply %}
+            <details><summary style="cursor:pointer;">show reply</summary>
+              <pre style="white-space:pre-wrap;word-break:break-word;max-width:520px;margin:6px 0 0;font-size:12px;">{{ u.raw_reply }}</pre>
+            </details>
+            {% else %}<span class="secondary">—</span>{% endif %}
+          </td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% else %}
+  <p class="secondary" style="margin:0 0 18px;">None — every evaluated page was scored (kept or dropped).</p>
+  {% endif %}
+
+  {# Advanced-only: the actual completed prompt sent to the model for each phase. #}
+  <details id="ex-prompts" data-level="advanced" style="margin-top:34px;max-width:960px;">
+    <summary style="cursor:pointer;font-weight:700;font-size:16px;color:var(--link,#1d70b8);">Example completed prompts (per phase)</summary>
+    <div style="margin-top:12px;">
+      <p class="hint" style="margin:0 0 12px;max-width:860px;">Each phase's prompt rebuilt for one sample page. A run is
+        <strong>stamped</strong> with the prompt version and Include / Exclude context it used, so for a stamped phase
+        this is the <strong>exact</strong> text that was sent (only the page body reflects the current corpus). Older
+        runs, or a phase not yet run, fall back to the current active template — flagged below.</p>
+      <p id="ex-prompt-status" class="secondary"><span class="spinner"></span> Loading…</p>
+      <div id="ex-prompt-body" hidden>
+        <p id="ex-prompt-sample" class="secondary" style="margin:0 0 12px;"></p>
+
+        {% macro cmp(phase_label, tag_id, tmpl_id, filled_id) %}
+        <h3 style="margin:16px 0 8px;">{{ phase_label }} <span id="{{ tag_id }}" class="secondary" style="font-size:13px;font-weight:400;"></span></h3>
+        <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(320px,1fr));gap:16px;align-items:start;">
+          <div>
+            <div style="display:flex;align-items:baseline;justify-content:space-between;gap:8px;margin:0 0 6px;">
+              <span class="secondary" style="font-size:12px;font-weight:700;letter-spacing:.04em;text-transform:uppercase;">Original template</span>
+              <button type="button" class="btn secondary-btn ex-copy" data-target="{{ tmpl_id }}" style="padding:3px 10px;font-size:12px;">Copy</button>
+            </div>
+            <pre class="mono" id="{{ tmpl_id }}" style="white-space:pre-wrap;word-break:break-word;font-size:12px;
+              background:var(--surface-2);border:1px solid var(--border);border-radius:8px;padding:12px 14px;margin:0;"></pre>
+          </div>
+          <div>
+            <div style="display:flex;align-items:baseline;justify-content:space-between;gap:8px;margin:0 0 6px;">
+              <span class="secondary" style="font-size:12px;font-weight:700;letter-spacing:.04em;text-transform:uppercase;">Completed for this page</span>
+              <button type="button" class="btn secondary-btn ex-copy" data-target="{{ filled_id }}" style="padding:3px 10px;font-size:12px;">Copy</button>
+            </div>
+            <pre class="mono" id="{{ filled_id }}" style="white-space:pre-wrap;word-break:break-word;font-size:12px;
+              background:var(--surface-2);border:1px solid var(--border);border-radius:8px;padding:12px 14px;margin:0;"></pre>
+          </div>
+        </div>
+        {% endmacro %}
+
+        {{ cmp("Phase 1 — Inclusion", "ex-incl-tag", "ex-tmpl-inclusion", "ex-prompt-inclusion") }}
+        {{ cmp("Phase 2 — Exclusion", "ex-excl-tag", "ex-tmpl-exclusion", "ex-prompt-exclusion") }}
+      </div>
+    </div>
+  </details>
+
+  {# What actually controlled each phase of this run — so a run's real settings are unmistakable. #}
+  <h2 style="margin-top:34px;">Run configuration</h2>
+  <p class="hint">The settings that governed each phase of this run (stamped when the run was created,
+    so they're what actually ran — not just the run's name).</p>
+  <div class="table-wrap">
+    <table style="font-size:14px;">
+      <thead><tr>
+        <th>Phase</th><th>Supplier / model</th><th>Prompt variant</th>
+        <th class="num">Concurrency</th><th>Caching</th>
+        <th title="Fingerprint (hash) of the prompt template text this phase ran with — the same fingerprint means the same prompt">Prompt fingerprint</th>
+        <th title="Git commit of the code that created the run — it changes on any commit, so by itself it does not mean the prompt changed">Code (git)</th>
+        <th class="num">Body limit</th>
+      </tr></thead>
+      <tbody>
+        {% for rc in run_configs %}
+        <tr {% if rc.phase == run.phase %}style="background:var(--surface-3);font-weight:600;"{% endif %}>
+          <td>{{ rc.phase or '—' }}</td>
+          <td class="mono">{{ rc.provider or '—' }} / {{ rc.model or '—' }}</td>
+          <td>{{ rc.prompt_variant }}</td>
+          <td class="num">{{ rc.concurrency }}×</td>
+          <td>{{ 'on' if rc.caching else 'off' }}</td>
+          <td class="mono">{% if rc.template_hash %}{{ rc.template_hash }}{% else %}—{% endif %}{% if not rc.stamped %} <span class="secondary" title="Run predates prompt stamping — its exact prompt text is not recorded">(legacy)</span>{% endif %}</td>
+          <td class="mono">{% if rc.template_version is not none %}{{ rc.template_version }}{% else %}—{% endif %}</td>
+          <td class="num">{{ '{:,}'.format(rc.body_limit) if rc.body_limit else '—' }}</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  <p class="hint" style="margin-top:8px;">Concurrency &gt; 1 evaluates that many pages in parallel; the
+    <em>cached</em> prompt variant reorders the prompt so its stable half can be cached (and, with caching on,
+    sets an Anthropic cache breakpoint). Both phases inherit the trial chosen at “New Run”.</p>
+
+  <script>
+    const CID = {{ category.id }}, RUN_ID = {{ run.run_id|tojson }};
+    const CHAIN_IDS = {{ (chain|map(attribute='run_id')|list)|tojson }};
+    const RUN_STATE = {{ run_state|tojson }};   // DB truth at page load: 'fresh' | 'partial' | 'complete' | …
+
+    // Per-page results (guc-0006): fetched from the run's results API, filtered client-side.
+    (function () {
+      const tbody = document.querySelector("#pr-table tbody"), sum = document.getElementById("pr-summary");
+      const filter = document.getElementById("pr-filter");
+      const sizeSel = document.getElementById("pr-page-size");
+      const pager = document.getElementById("pr-pager"), rangeEl = document.getElementById("pr-range");
+      const prevBtn = document.getElementById("pr-prev"), nextBtn = document.getElementById("pr-next");
+      const esc = s => { const d = document.createElement("div"); d.textContent = s == null ? "" : s; return d.innerHTML; };
+      let all = [], page = 0;
+      const pageSize = () => { const v = sizeSel ? sizeSel.value : "20"; return v === "all" ? Infinity : (parseInt(v, 10) || 20); };
+      function render() {
+        const f = filter.value;
+        const rows = f === "" ? all : all.filter(r => String(r.keep) === f);
+        sum.textContent = `${rows.length} of ${all.length} page${all.length === 1 ? "" : "s"}`;
+        const size = pageSize();
+        const nPages = Math.max(1, Math.ceil(rows.length / (size === Infinity ? (rows.length || 1) : size)));
+        if (page >= nPages) page = nPages - 1;
+        if (page < 0) page = 0;
+        const start = size === Infinity ? 0 : page * size;
+        const slice = size === Infinity ? rows : rows.slice(start, start + size);
+        if (!rows.length) {
+          tbody.innerHTML = '<tr><td colspan="8" class="secondary" style="padding:10px 6px;">No pages.</td></tr>';
+          if (pager) pager.hidden = true;
+          return;
+        }
+        if (pager) {
+          if (size === Infinity || rows.length <= size) { pager.hidden = true; }
+          else {
+            pager.hidden = false;
+            rangeEl.textContent = `${start + 1}–${Math.min(start + size, rows.length)} of ${rows.length}`;
+            prevBtn.disabled = page === 0;
+            nextBtn.disabled = page >= nPages - 1;
+          }
+        }
+        tbody.innerHTML = slice.map(r => {
+          const verdict = r.keep === 1 ? '<span style="color:var(--green,#00703c);font-weight:700;">Keep</span>'
+                        : r.keep === 0 ? '<span style="color:var(--red,#d4351c);font-weight:700;">Drop</span>'
+                        : '<span class="secondary">Unscored</span>';
+          const quotes = (r.evidence || "").split(" | ").filter(Boolean)
+                           .map(q => `<li>“${esc(q)}”</li>`).join("");
+          return `<tr>
+            <td><a href="${esc(r.url)}" target="_blank" rel="noopener" style="word-break:break-all;">${esc(r.url)}</a></td>
+            <td>${verdict}</td>
+            <td class="num">${r.score == null ? '<span class="secondary">—</span>' : Number(r.score).toFixed(2)}</td>
+            <td>${esc(r.confidence || "")}</td>
+            <td>${esc(r.primary_topic || "—")}</td>
+            <td>${esc(r.where_hit || "—")}</td>
+            <td>${quotes ? `<ul style="margin:0;padding-left:16px;">${quotes}</ul>` : '<span class="secondary">—</span>'}</td>
+            <td class="secondary">${esc(r.reason || "")}</td>
+          </tr>`;
+        }).join("");
+      }
+      filter.addEventListener("change", () => { page = 0; render(); });
+      if (sizeSel) sizeSel.addEventListener("change", () => { page = 0; render(); });
+      if (prevBtn) prevBtn.addEventListener("click", () => { if (page > 0) { page--; render(); } });
+      if (nextBtn) nextBtn.addEventListener("click", () => { page++; render(); });
+      fetch(`/api/categories/${CID}/runs/${RUN_ID}/results`, { headers: { "Accept": "application/json" } })
+        .then(r => r.json())
+        .then(j => { all = (j && j.rows) || []; render(); })
+        .catch(() => { tbody.innerHTML = '<tr><td colspan="8" class="secondary" style="padding:10px 6px;">Could not load results.</td></tr>'; });
+    })();
+    const nameInput = document.getElementById("run-name");
+    const status = document.getElementById("name-status");
+    async function saveName() {
+      const name = nameInput.value.trim();
+      if (!name) { status.textContent = "Name can't be empty."; return; }
+      status.innerHTML = '<span class="spinner"></span>';
+      try {
+        const res = await fetch(`/api/categories/${CID}/runs/${RUN_ID}/rename`,
+          { method: "POST", body: new URLSearchParams({ name }) });
+        const j = await res.json();
+        if (res.ok && j.ok) {
+          status.textContent = "Saved.";
+          const t = document.getElementById("run-title"); if (t) t.textContent = "Run Details for " + name;
+        } else { status.textContent = "Error: " + (j.error || res.status); }
+      } catch (e) { status.textContent = "Could not save."; }
+    }
+    document.getElementById("save-name").addEventListener("click", saveName);
+    nameInput.addEventListener("keydown", e => { if (e.key === "Enter") { e.preventDefault(); saveName(); } });
+
+    // Reprocess the pages that failed to parse in this run (in place, with per-page backoff).
+    const retryBtn = document.getElementById("retry-unparsable");
+    if (retryBtn) retryBtn.addEventListener("click", async () => {
+      if (!confirm("Re-ask the model for the pages that failed to parse in this run, in its own "
+        + "inclusion/exclusion phases. It retries transient errors (e.g. rate limits) with backoff and "
+        + "uses API credit. Continue?")) return;
+      const st = document.getElementById("retry-status");
+      retryBtn.disabled = true; st.textContent = "Reprocessing… (this can take a moment with backoff)";
+      try {
+        const j = await (await fetch(`/api/categories/${CID}/retry-unparsable?run=${encodeURIComponent(RUN_ID)}`,
+          { method: "POST" })).json();
+        if (j.error) { st.textContent = "Error: " + j.error; retryBtn.disabled = false; return; }
+        if (!j.retried) { st.textContent = "Nothing to reprocess — no failed rows."; retryBtn.disabled = false; return; }
+        st.textContent = `Reprocessed ${j.retried}: ${j.now_parsed} now parsed, ${j.still_unparsable} still failing`
+          + ` ($${(j.cost_usd || 0).toFixed(2)}) — refreshing…`;
+        setTimeout(() => location.reload(), 1200);
+      } catch (e) { st.textContent = "Could not reprocess."; retryBtn.disabled = false; }
+    });
+
+    // Start / continue this run: make it the active run, then run it in the background.
+    const completeBtn = document.getElementById("complete-run");
+    const isFreshRun = !!(completeBtn && completeBtn.dataset.fresh);
+    // "Start Run" is enabled only once the run name has more than 3 chars; always disabled while running.
+    function refreshActionBtn(running) {
+      if (!completeBtn) return;
+      completeBtn.disabled = running || (isFreshRun && nameInput.value.trim().length <= 3);
+    }
+    if (completeBtn) {
+      refreshActionBtn(false);
+      nameInput.addEventListener("input", () => refreshActionBtn(false));
+    }
+    if (completeBtn) {
+      const cs = document.getElementById("complete-status");
+      completeBtn.addEventListener("click", async () => {
+        completeBtn.disabled = true;
+        cs.innerHTML = '<span class="spinner"></span> Starting…';
+        try {
+          // Point the category's active run at the phase that still needs work
+          // (resume it, or start the pending exclusion), then run it in the background.
+          const cont = await (await fetch(`/api/categories/${CID}/runs/${RUN_ID}/continue`, { method: "POST" })).json();
+          if (cont.error) { cs.textContent = "Error: " + cont.error; completeBtn.disabled = false; return; }
+          if (cont.done) { cs.textContent = "Nothing to continue — already complete."; return; }
+          const j = await (await fetch(`/api/categories/${CID}/evaluate-bg/start`, { method: "POST" })).json();
+          if (j.error) { cs.textContent = "Error: " + j.error; completeBtn.disabled = false; return; }
+          const poll = setInterval(async () => {
+            let s;
+            try { s = await (await fetch(`/api/categories/${CID}/evaluate-bg/status`)).json(); }
+            catch (e) { return; }
+            const done = (s.done || 0).toLocaleString();
+            if (s.running) {
+              cs.innerHTML = `<span class="spinner"></span> Running in the background — evaluated ${done}`
+                + (s.phase ? ` (${s.phase})` : "");
+            } else {
+              clearInterval(poll);
+              cs.textContent = s.error ? ("Error: " + s.error) : "Finished — refreshing…";
+              setTimeout(() => location.reload(), 900);
+            }
+          }, 3000);
+        } catch (e) { cs.textContent = "Could not start."; completeBtn.disabled = false; }
+      });
+    }
+
+    // Live "is this run still running?" check. Polls the background-evaluation status
+    // and shows the banner only while a bg run for THIS run's lineage is in progress;
+    // when it finishes, refresh so the phase table shows the final numbers.
+    (function () {
+      const box = document.getElementById("run-live");
+      const txt = document.getElementById("run-live-text");
+      const spin = document.getElementById("run-live-spin");
+      if (!box) return;
+      const CHAIN = CHAIN_IDS.map(String);
+      let timer = null, everRan = false;
+      function stop() { if (timer) { clearInterval(timer); timer = null; } }
+      function showSpinner(on) { if (spin) spin.style.display = on ? "" : "none"; }
+      // DB truth: is any run in this lineage actually alive (live pid + fresh heartbeat)?
+      // The in-memory evaluate-bg/status can outlive the real job — a restart wipes it
+      // (so a resumed/duplicate entry can read running with no live driver), and a job
+      // that finished without clearing its flag lingers as running — so we never trust
+      // it on its own.
+      async function chainAlive() {
+        try {
+          const rj = await (await fetch(`/api/categories/${CID}/runs`)).json();
+          return (rj.runs || []).some(r => CHAIN.includes(String(r.run_id)) && r.alive);
+        } catch (e) { return false; }
+      }
+      function finish() {                       // nothing is genuinely running
+        stop();
+        showSpinner(false);                     // spinner never spins for a finished run
+        if (everRan) {                          // was running this session → reload for final data
+          box.hidden = false;
+          box.style.borderLeftColor = "var(--green)";
+          txt.textContent = "Evaluation finished — refreshing…";
+          setTimeout(() => location.reload(), 900);
+        } else {
+          box.hidden = true;                    // no banner
+        }
+      }
+      async function check() {
+        let s;
+        try { s = await (await fetch(`/api/categories/${CID}/evaluate-bg/status`)).json(); }
+        catch (e) { return; }
+        const claimed = !!(s.running && s.run_id != null && CHAIN.includes(String(s.run_id)));
+        // Reconcile the in-memory claim against the DB: show "still evaluating" only if a
+        // run in this lineage is genuinely alive. Guards the banner against outliving a restart.
+        const mine = claimed && await chainAlive();
+        refreshActionBtn(mine);   // disabled while running (and Start Run needs a >3-char name)
+        if (mine) {
+          everRan = true;
+          box.hidden = false;
+          showSpinner(true);
+          const done = Number(s.done || 0).toLocaleString();
+          txt.textContent = `This run is still evaluating in the background — ${done} pages done`
+            + (s.remaining != null ? ` · ${Number(s.remaining).toLocaleString()} left` : "")
+            + (s.phase ? ` · ${s.phase}` : "");
+          if (!timer) timer = setInterval(check, 3000);
+        } else {
+          finish();
+        }
+      }
+      // Load-time reconciliation: if the DB already says this run's lineage is complete,
+      // never show the "still evaluating" banner or spinner — and don't even poll.
+      if (RUN_STATE === "complete") { box.hidden = true; showSpinner(false); refreshActionBtn(false); }
+      else check();
+    })();
+
+    // Advanced-only: lazily fetch the completed example prompts the first time the rolldown opens.
+    (function () {
+      const det = document.getElementById("ex-prompts");
+      if (!det) return;
+      let loaded = false;
+      det.addEventListener("toggle", async () => {
+        if (!det.open || loaded) return;
+        loaded = true;
+        const statusEl = document.getElementById("ex-prompt-status");
+        try {
+          const j = await (await fetch(`/api/categories/${CID}/example-prompts?run_id=${encodeURIComponent(RUN_ID)}`)).json();
+          if (j.error) { statusEl.textContent = "Error: " + j.error; loaded = false; return; }
+          document.getElementById("ex-tmpl-inclusion").textContent = j.inclusion_template || "(none)";
+          document.getElementById("ex-tmpl-exclusion").textContent = j.exclusion_template || "(none)";
+          document.getElementById("ex-prompt-inclusion").textContent = j.inclusion || "(none)";
+          document.getElementById("ex-prompt-exclusion").textContent = j.exclusion || "(none)";
+          const tag = (exact, ver) => exact
+            ? ("· exact — stamped from this run" + (ver != null ? ` (prompt v${ver})` : ""))
+            : "· reconstructed from the current template (this run wasn't stamped)";
+          document.getElementById("ex-incl-tag").textContent = tag(j.inclusion_exact, j.inclusion_version);
+          document.getElementById("ex-excl-tag").textContent = tag(j.exclusion_exact, j.exclusion_version);
+          document.getElementById("ex-prompt-sample").textContent = j.sample_url
+            ? ((j.sample_from_run ? "Sample page (evaluated in this run): " : "Sample page (from the current shortlist): ")
+               + (j.sample_title || j.sample_url))
+            : "No shortlisted page yet — showing the templates with placeholders.";
+          statusEl.hidden = true;
+          document.getElementById("ex-prompt-body").hidden = false;
+        } catch (e) { statusEl.textContent = "Could not load the example prompts."; loaded = false; }
+      });
+
+      // Copy a prompt block to the clipboard (with a select+execCommand fallback).
+      document.querySelectorAll(".ex-copy").forEach(btn => {
+        btn.addEventListener("click", async () => {
+          const pre = document.getElementById(btn.dataset.target);
+          const text = pre ? pre.textContent : "";
+          if (!text) return;
+          const label = btn.dataset.label || (btn.dataset.label = btn.textContent);
+          let ok = false;
+          try { await navigator.clipboard.writeText(text); ok = true; }
+          catch (e) {
+            try {
+              const r = document.createRange(); r.selectNodeContents(pre);
+              const sel = window.getSelection(); sel.removeAllRanges(); sel.addRange(r);
+              ok = document.execCommand("copy"); sel.removeAllRanges();
+            } catch (e2) { ok = false; }
+          }
+          btn.textContent = ok ? "Copied ✓" : "Copy failed";
+          btn.disabled = true;
+          setTimeout(() => { btn.textContent = label; btn.disabled = false; }, 1200);
+        });
+      });
+    })();
+  </script>
+{% endblock %}

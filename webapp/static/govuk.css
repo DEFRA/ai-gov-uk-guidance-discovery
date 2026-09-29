@@ -1,0 +1,269 @@
+/* Refined GOV.UK — proposed replacement for webapp/static/govuk.css
+   Keeps the government palette; modernises type, spacing, borders and tables.
+   Self-contained (no external fonts/CDN) so it works on the Lightsail box. */
+
+:root {
+  --black:#0b0c0c; --ink:#1a1c1c; --white:#ffffff;
+  --blue:#1d70b8; --dark-blue:#003078; --visited:#4c2c92;
+  --green:#00703c; --green-dark:#005a30; --green-shadow:#00351c;
+  --red:#d4351c;
+  --border:#d7dadb;          /* soft hairline */
+  --border-mid:#c3c7c9;
+  --grey-text:#505a5f; --muted:#6b7477;
+  --surface:#ffffff; --surface-2:#f7f8f8; --surface-3:#f1f4f6;
+  --panel-blue:#eef4fa; --tag-blue:#d2e2f1; --focus:#ffdd00;
+  --radius:8px; --radius-sm:5px;
+  --shadow-sm:0 1px 2px rgba(11,12,12,.06), 0 1px 3px rgba(11,12,12,.05);
+  --sans:"Inter", ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+  --mono:"SFMono-Regular", ui-monospace, "Cascadia Code", Consolas, "Liberation Mono", monospace;
+}
+* { box-sizing:border-box; }
+/* The hidden attribute must win over component display rules (e.g. .btn). */
+[hidden] { display:none !important; }
+html { -webkit-text-size-adjust:100%; }
+body { margin:0; background:var(--surface-2); color:var(--ink);
+  font-family:var(--sans); font-size:17px; line-height:1.5;
+  -webkit-font-smoothing:antialiased; text-rendering:optimizeLegibility; }
+
+a { color:var(--blue); text-underline-offset:2px; }
+a:hover { color:var(--dark-blue); }
+/* Buttons keep their own colour — exclude them so the visited colour never wins. */
+a:not(.btn):visited { color:var(--visited); }
+a:focus, button:focus, input:focus, textarea:focus, select:focus, summary:focus {
+  outline:3px solid var(--focus); outline-offset:0; box-shadow:0 2px 0 var(--black); }
+
+/* ---- layout ---- */
+.masthead { background:var(--black); border-bottom:3px solid var(--blue); padding:14px 0; }
+.masthead .wrap { display:flex; align-items:center; gap:14px; }
+.masthead .brand-logo { height:36px; width:auto; display:block; flex:none; }
+.masthead .brand { color:var(--white); font-size:22px; font-weight:700; letter-spacing:-.01em; line-height:1.2; }
+.navbar { background:var(--white); border-bottom:1px solid var(--border);
+  box-shadow:var(--shadow-sm); position:sticky; top:0; z-index:5; }
+.navbar .inner { display:flex; gap:28px; flex-wrap:wrap; align-items:stretch; }
+.navbar .service { font-size:16px; font-weight:700; padding:14px 0; color:var(--black); }
+.navbar a { font-size:16px; padding:14px 2px; text-decoration:none; color:var(--grey-text);
+  border-bottom:3px solid transparent; margin-bottom:-1px; transition:color .12s, border-color .12s; }
+.navbar a:hover { color:var(--dark-blue); }
+.navbar a.active { font-weight:700; color:var(--black); border-bottom-color:var(--blue); }
+.wrap { max-width:none; margin:0; padding:0 32px; }
+.body { padding-bottom:72px; }
+.site-strap { text-align:center; color:var(--muted); font-size:13px; letter-spacing:.02em;
+  padding:20px 16px 40px; border-top:1px solid var(--border); margin-top:48px; }
+
+/* UI display level (Profile, guc-0016): two tiers, Simple and Advanced. Tag an element with
+   data-level="advanced" to hide it in Simple and reveal it in Advanced. Admin-only content is
+   gated by the Admin role in the template ({% if is_admin %}), not by this display level. The
+   legacy expert/admin data-level values are hidden in Simple too, for any stragglers. */
+[data-ui-level="simple"] [data-level="advanced"],
+[data-ui-level="simple"] [data-level="expert"],
+[data-ui-level="simple"] [data-level="admin"] { display:none !important; }
+
+/* Profile page level cards. */
+.level-card { display:flex; gap:12px; align-items:flex-start; border:2px solid var(--border-mid);
+  border-radius:8px; padding:14px 16px; cursor:pointer; background:var(--white); }
+.level-card:hover { border-color:var(--muted); }
+.level-card.current { border-color:var(--black); background:var(--surface-2); }
+.level-card input { margin-top:3px; flex:none; }
+
+.phase { display:flex; gap:12px; align-items:center; padding:14px 0; flex-wrap:wrap; }
+.tag { background:var(--tag-blue); color:var(--dark-blue); font-size:12px; font-weight:700;
+  letter-spacing:.04em; text-transform:uppercase; padding:3px 9px; border-radius:999px; }
+.phase .meta { font-size:14px; color:var(--muted); }
+
+h1 { font-size:34px; font-weight:800; line-height:1.15; letter-spacing:-.02em; margin:32px 0 14px; }
+h2 { font-size:22px; font-weight:700; line-height:1.3; letter-spacing:-.01em; margin:34px 0 16px; }
+h3 { font-size:17px; font-weight:700; margin:0; }
+.lede { max-width:680px; font-size:19px; color:var(--ink); }
+.secondary { font-size:15px; color:var(--grey-text); }
+.hint { font-size:15px; color:var(--muted); margin:5px 0 10px; }
+.back { display:inline-block; font-size:15px; padding-top:26px; }
+/* Breadcrumb trail (replaces the single back link at the top of a page). */
+.crumbs { list-style:none; margin:0; padding:22px 0 0; font-size:14px; display:flex; flex-wrap:wrap; align-items:center; }
+.crumbs li { display:inline-flex; align-items:center; }
+.crumbs li + li::before { content:"›"; color:var(--muted); margin:0 9px; }
+.crumbs a { color:var(--blue); }
+.crumbs a:hover { color:var(--dark-blue,#003078); }
+.crumbs .current { color:var(--muted); }
+/* Column picker: field-selector sections flow into balanced columns and never split across one. */
+.col-picker { column-count:3; column-gap:36px; margin-top:10px; }
+.col-picker > div { break-inside:avoid; -webkit-column-break-inside:avoid; page-break-inside:avoid; margin:0 0 16px; }
+.col-picker .check { display:block; font-size:14px; line-height:1.7; }
+@media (max-width:900px) { .col-picker { column-count:2; } }
+@media (max-width:560px) { .col-picker { column-count:1; } }
+code, .mono { font-family:var(--mono); font-size:.92em; }
+
+/* ---- forms ---- */
+.field { margin-bottom:28px; }
+label.q, .field > label, legend.q { display:block; font-size:17px; font-weight:700; margin-bottom:6px; }
+input[type=text], input[type=email], input[type=password], input[type=number], input[type=search], textarea, select {
+  font-family:var(--sans); font-size:16px; padding:9px 11px; background:var(--white);
+  border:1.5px solid var(--border-mid); border-radius:var(--radius-sm); color:var(--ink); }
+input[type=text]:hover, input[type=email]:hover, input[type=password]:hover, input[type=number]:hover, input[type=search]:hover,
+select:hover, textarea:hover { border-color:var(--muted); }
+input[type=text], input[type=email], input[type=password] { width:100%; max-width:440px; }
+input.narrow { max-width:340px; }
+
+/* Show/hide password eye toggle (wraps each password field — see _LOGIN_HEAD). */
+.pw-wrap { position:relative; display:block; }
+.pw-wrap input { width:100%; padding-right:44px; }
+.pw-toggle { position:absolute; top:0; right:0; height:100%; width:42px; padding:0;
+  display:flex; align-items:center; justify-content:center; background:none; border:0;
+  color:var(--grey-text); cursor:pointer; }
+.pw-toggle:hover { color:var(--ink); }
+.pw-toggle svg { width:20px; height:20px; }
+
+/* Auth pages (sign in / create account): compact, equal-width fields. */
+.authform { max-width:440px; }
+.authform .field { margin-bottom:16px; }
+.authform input[type=text], .authform input[type=email], .authform input[type=password] {
+  width:100%; max-width:none; box-sizing:border-box; }
+.pw-suggest { background:var(--surface-2); border:1px solid var(--border);
+  border-radius:var(--radius-sm); padding:12px 14px; margin:0 0 16px; font-size:15px; max-width:440px; }
+.pw-suggest code { font-family:ui-monospace, Menlo, Consolas, monospace; font-weight:700; font-size:16px; }
+/* Policy: textareas auto-size to fit their content so nothing is hidden behind an
+   inner scrollbar. field-sizing:content does this natively (grows on display and as
+   you type); base.html has a JS fallback for browsers without it. They grow to
+   max-height then scroll, and stay drag-resizable. */
+textarea { width:100%; box-sizing:border-box; field-sizing:content;
+  min-height:5.2em; max-height:60vh; overflow-y:auto; resize:vertical; }
+select { min-width:120px; }
+
+/* ---- cards / surfaces ---- */
+.card { background:var(--surface); border:1px solid var(--border); border-radius:var(--radius);
+  box-shadow:var(--shadow-sm); padding:22px 24px; margin:0 0 24px; }
+details { margin:0 0 10px; }
+summary { cursor:pointer; list-style:none; font-size:15px; color:var(--blue); font-weight:600; margin:0 0 10px; }
+summary::-webkit-details-marker { display:none; }
+.detail { border-left:4px solid var(--blue); background:var(--surface-2);
+  border-radius:0 var(--radius-sm) var(--radius-sm) 0; padding:14px 18px; margin:0 0 16px;
+  font-size:15px; max-width:680px; }
+.detail p { margin:0 0 10px; }
+.example { background:var(--surface-3); border:1px solid var(--border); border-radius:var(--radius-sm);
+  padding:16px; font-size:15px; }
+
+.picker { max-height:240px; overflow:auto; border:1px solid var(--border); border-radius:var(--radius-sm);
+  padding:12px 16px; display:flex; flex-direction:column; gap:10px; max-width:680px; background:var(--white); }
+.checkgrid { display:grid; grid-template-columns:repeat(auto-fit, minmax(220px, 1fr)); gap:14px 20px; }
+.check { display:flex; gap:10px; align-items:center; font-size:15px; }
+.check input { width:20px; height:20px; accent-color:var(--black); flex:none; }
+
+.btn { display:inline-flex; align-items:center; gap:8px; font-family:var(--sans); font-size:16px; font-weight:600;
+  background:var(--green); color:var(--white); border:1px solid transparent; border-radius:var(--radius-sm);
+  box-shadow:0 2px 0 var(--green-shadow); padding:10px 16px; text-decoration:none; cursor:pointer;
+  transition:background .12s, transform .04s; }
+.btn:hover { background:var(--green-dark); color:var(--white); }
+.btn:active { transform:translateY(1px); box-shadow:0 1px 0 var(--green-shadow); }
+.btn.secondary-btn { background:var(--white); color:var(--ink); border-color:var(--border-mid);
+  box-shadow:0 1px 0 rgba(11,12,12,.06); }
+.btn.secondary-btn:hover { background:var(--surface-3); color:var(--black); border-color:var(--muted); }
+.btn.danger-btn { background:var(--red,#d4351c); color:var(--white); box-shadow:0 2px 0 #942514; }
+.btn.danger-btn:hover { background:#a91b0d; color:var(--white); }
+
+/* ---- tabs ---- */
+.tabs { display:flex; gap:4px; border-bottom:1px solid var(--border); }
+.tabs a, .tabs .current { font-size:16px; padding:10px 18px; text-decoration:none; border-radius:var(--radius-sm) var(--radius-sm) 0 0; }
+.tabs .current { font-weight:700; background:var(--white); border:1px solid var(--border);
+  border-bottom:1px solid var(--white); margin-bottom:-1px; }
+.tabs a { background:var(--surface-3); color:var(--blue); }
+.tabs a:hover { background:var(--surface-2); }
+.tabpanel { position:relative; border:1px solid var(--border); border-top:none; padding:28px 24px 30px; background:var(--white);
+  border-radius:0 0 var(--radius) var(--radius); }
+
+/* ---- tables ---- */
+.table-wrap { background:var(--surface); border:1px solid var(--border); border-radius:var(--radius);
+  box-shadow:var(--shadow-sm); overflow:hidden; margin:0 0 32px; }
+table { width:100%; border-collapse:collapse; font-size:15px; margin-bottom:32px; }
+.table-wrap table { margin:0; }
+/* Column headers wrap aggressively rather than widening the column: a long
+   heading breaks onto multiple lines (even mid-word if needed) instead of
+   forcing the column wider than its data. See CLAUDE.md. */
+th { text-align:left; font-weight:700; font-size:13px; letter-spacing:.02em; text-transform:uppercase;
+  color:var(--grey-text); padding:12px 18px; background:var(--surface-2);
+  border-bottom:1px solid var(--border-mid); white-space:normal; overflow-wrap:break-word; }
+th.num, td.num { text-align:right; font-variant-numeric:tabular-nums; }
+td { padding:13px 18px; border-bottom:1px solid var(--border); vertical-align:top; }
+tbody tr:last-child td { border-bottom:none; }
+tbody tr { transition:background .1s; }
+tbody tr:hover { background:var(--surface-2); }
+.name-link { font-weight:700; }
+.sub { display:block; color:var(--muted); font-size:13px; margin-top:2px; }
+.actions { display:inline-flex; gap:16px; align-items:baseline; }
+/* A <button> that reads as an inline text link (for POST actions inside a row). */
+.linkish { background:none; border:0; padding:0; margin:0; font:inherit; cursor:pointer;
+  color:var(--blue); text-decoration:underline; text-underline-offset:2px; }
+.linkish:hover { color:var(--dark-blue); }
+.pill { display:inline-block; font-size:12px; font-weight:700; padding:3px 10px; border-radius:999px; }
+.pill.draft { background:#fdf3d8; color:#7a5b00; }
+.pill.published { background:#d9f2e4; color:var(--green-dark); }
+.pill.archived { background:var(--surface-3); color:var(--muted); }
+
+/* ---- notices ---- */
+.error-summary { border:2px solid var(--red); border-radius:var(--radius-sm); padding:16px 20px; margin:0 0 28px; max-width:680px; }
+.error-summary h2 { font-size:17px; color:var(--red); margin:0 0 10px; }
+.error-summary ul { margin:0; padding-left:20px; }
+.error-summary a { color:var(--red); }
+.success { border:1px solid #b9e0c9; border-left:5px solid var(--green); background:#f2faf5;
+  border-radius:var(--radius-sm); padding:14px 16px; margin:0 0 28px; }
+.metric { font-size:44px; font-weight:800; line-height:1; letter-spacing:-.02em; }
+.metric-label { font-size:15px; color:var(--muted); }
+
+/* ---- spinner + timings ---- */
+/* "Show SQL" disclosures under lists (advanced users only). */
+.sql-details { margin:8px 0 0; }
+.sql-details > summary { cursor:pointer; font-size:13px; color:var(--blue); font-weight:600; }
+.sql-pre { white-space:pre-wrap; font-size:13px; line-height:1.45; overflow-x:auto;
+  background:var(--surface-2); border:1px solid var(--border); border-radius:6px;
+  padding:10px 12px; margin:6px 0 0; }
+
+.spinner { display:inline-block; width:16px; height:16px; vertical-align:-3px;
+  border:3px solid var(--border-mid); border-top-color:var(--blue); border-radius:50%;
+  animation:spin .7s linear infinite; }
+@keyframes spin { to { transform:rotate(360deg); } }
+.timing { font-size:14px; color:var(--muted); font-variant-numeric:tabular-nums; }
+td.num.timing, th.num { font-variant-numeric:tabular-nums; }
+.controls { display:flex; gap:18px; align-items:baseline; flex-wrap:wrap; margin:0 0 16px; }
+.controls select { font-size:15px; padding:8px 10px; border:1.5px solid var(--border-mid); border-radius:var(--radius-sm); }
+/* Funnel stage label as a roll-down: the label is the <summary>; opening it
+   reveals the filter values / keywords. The count is appended in the label. */
+.filter-values { display:block; }
+.filter-values summary { display:list-item; list-style-position:inside; margin-left:0;
+  font-size:13px; color:var(--blue,#1d70b8); cursor:pointer; }
+.filter-values summary:hover { text-decoration:underline; }
+.filter-values .detail { font-size:13px; margin:6px 0 0; padding:6px 0 6px 18px; white-space:normal; }
+.filter-values:not([open]) .detail { display:none; }
+
+/* Per-page tracking ID (guc-####) — bottom-left, mid-grey. One unique ID per
+   page; retire but never reuse. Registry + rule: PAGE_INDEX.md. */
+.page-id { position:fixed; left:12px; bottom:8px; z-index:20; font-size:12px;
+  color:var(--muted); letter-spacing:.02em; font-variant-numeric:tabular-nums;
+  user-select:all; background:rgba(255,255,255,.72); padding:1px 6px; border-radius:4px; }
+.page-id:empty { display:none; }
+@media (max-width:600px) { .page-id { background:none; } }
+
+/* Compact daily-AI-spend indicator shown on the top phase line (base.html). */
+.budget-inline { display:inline-flex; align-items:center; gap:6px; font-size:14px; }
+.budget-inline .meta { font-size:14px; color:var(--muted); }
+.budget-track { width:80px; height:8px; background:#e8e8e8; border-radius:5px; overflow:hidden; display:inline-block; vertical-align:middle; }
+.budget-fill { display:block; height:100%; transition:width .3s; }
+
+/* Per-sub-tab identifier (page-id + a letter, e.g. guc-0003a) — light grey,
+   shown inside the tab label so a tab can be named in support. See PAGE_INDEX.md. */
+/* Active sub-tab identifier ({page-id}{letter}), bottom-left of the tab pane. */
+.pane-id { position:absolute; left:14px; bottom:8px; color:var(--muted);
+  font-weight:400; font-size:11px; letter-spacing:.02em; }
+.pane-id:empty { display:none; }
+
+/* AI Pipeline shared partial (Explainability + Shortlist pages): run-state chips, pages
+   drift, and the stalled-run banner. Kept here so both pages style the partial identically. */
+.run-chip { display:inline-block; font-size:11px; font-weight:700; padding:1px 7px; border-radius:999px;
+  margin-left:6px; vertical-align:middle; }
+.run-chip.running { background:#d2e2f1; color:#0b3d6b; }
+.run-chip.stalled { background:#fbe5d6; color:#8a3b12; }
+.run-chip.stopped-warn { background:#fdf3d8; color:#7a5b00; }
+.run-chip.stopped-bad { background:#f6d7d2; color:#942316; }
+.pg-sub { color:var(--muted,#6b7477); font-weight:400; }
+.pg-drift { display:inline-block; margin-left:6px; font-size:11px; font-weight:700; padding:0 6px;
+  border-radius:999px; background:#fdf0e6; color:#8a4b12; vertical-align:middle; cursor:help; }
+.sd-warn { background:#fdf0ee; border:1px solid #e6b8ae; border-left:4px solid #d4351c;
+  border-radius:6px; padding:12px 14px; max-width:900px; font-size:14px; }
+.sd-warn .hd { font-weight:700; color:#942514; }

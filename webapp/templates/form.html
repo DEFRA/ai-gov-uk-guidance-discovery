@@ -1,0 +1,587 @@
+{% extends "base.html" %}
+{% from "_category_tabs.html" import category_tabs with context %}
+{% block page_id %}guc-0002{% endblock %}
+{% block title %}{{ form_title if is_edit else 'Build shortlist' }}{% endblock %}
+{% block content %}
+  <style>
+    .chk-search { width:100%; max-width:520px; box-sizing:border-box; padding:8px 10px;
+      border:2px solid var(--black); border-radius:6px; margin-bottom:6px; font:inherit; }
+    .checklist { max-width:520px; max-height:260px; overflow-y:auto; border:2px solid var(--black);
+      border-radius:6px; padding:6px 8px; background:var(--white,#fff); }
+    .chk-item { display:flex; align-items:center; gap:9px; padding:4px 4px; font-size:15px;
+      cursor:pointer; border-radius:4px; }
+    .chk-item:hover { background:var(--surface-2,#f3f2f1); }
+    .chk-item input { width:18px; height:18px; flex:0 0 auto; margin:0; }
+    /* Selected-items summary box (GDS-style removable tags). */
+    .sel-box { max-width:520px; box-sizing:border-box; display:flex; flex-wrap:wrap; gap:6px;
+      align-items:center; min-height:38px; border:1px solid var(--border-mid,#b1b4b6); border-radius:6px;
+      padding:6px 8px; background:var(--surface-2,#f3f2f1); margin-bottom:6px; }
+    .sel-empty { color:var(--muted,#6b7477); font-size:14px; padding:0 2px; }
+    .sel-chip { display:inline-flex; align-items:center; gap:6px; background:var(--blue,#1d70b8); color:#fff;
+      border-radius:4px; padding:3px 4px 3px 10px; font-size:13px; font-weight:600; }
+    .sel-x { background:none; border:0; color:#fff; font-size:16px; line-height:1; cursor:pointer;
+      padding:0 3px; border-radius:3px; }
+    .sel-x:hover { background:rgba(255,255,255,.25); }
+    /* Hierarchical organisation tree: children tucked under a parent, page count shown. */
+    .org-row { display:flex; align-items:center; gap:2px; }
+    .org-row .chk-item { flex:1 1 auto; }
+    .org-caret { flex:0 0 auto; width:20px; height:24px; border:0; background:none; cursor:pointer;
+      color:var(--muted,#6b7477); font-size:11px; line-height:1; padding:0; border-radius:4px; }
+    .org-caret:hover { background:var(--surface-2,#f3f2f1); color:var(--black); }
+    .org-caret-spacer { flex:0 0 auto; width:20px; }
+    .org-count-badge { color:var(--muted,#6b7477); font-size:13px; font-weight:400; font-variant-numeric:tabular-nums; }
+    .org-children[hidden] { display:none; }
+    /* Page Types disabled state (reserved — the widget now shows corpus-wide counts
+       when no organisation is chosen, so it is never locked). */
+    .dt-disabled .checklist, .dt-disabled .chk-search, .dt-disabled .sel-box {
+      opacity:.55; background:var(--surface-2,#f3f2f1); pointer-events:none; }
+    .dt-disabled .chk-search { cursor:not-allowed; }
+    .dt-hint-locked { color:var(--muted,#6b7477); }
+    /* Plain-English preview of what the keywords will match — collapsed into a rolldown. */
+    .kw-explain-wrap { max-width:640px; margin:8px 0 0; }
+    .kw-explain-wrap > summary { cursor:pointer; font-size:14px; color:var(--link,#1d70b8); }
+    .kw-explain { margin:6px 0 0; border:1px solid var(--border-mid,#b1b4b6);
+      border-radius:6px; background:var(--surface-2,#f3f2f1); padding:6px 12px; font-size:14px; }
+    .kw-explain .kx { padding:6px 0; border-top:1px solid var(--border,#e6e6e6); }
+    .kw-explain .kx:first-of-type { border-top:0; }
+    .kw-explain .kx-plain { display:block; margin-top:1px; color:var(--text,#0b0c0c); }
+    .kw-explain .kx-q { display:block; margin-top:2px; font-family:monospace; font-size:12px; color:var(--muted,#6b7477); }
+  </style>
+
+
+  <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:24px;flex-wrap:wrap;">
+    <div style="flex:1 1 420px;min-width:0;">
+      <h1 style="margin:20px 0 20px;">{{ form_title }}</h1>
+      <p class="lede" style="margin:0 0 20px;">A shortlist is a saved set of filters that finds GOV.UK pages
+        about one topic. These filters build the shortlist, which you can then retrieve.</p>
+    </div>
+    {% if is_edit %}
+    <form method="post" action="{{ url_for('delete_category_route', cid=category.id) }}"
+      style="flex:0 0 auto;margin:24px 0 0;"
+      onsubmit="return confirm('Delete “{{ form_title }}” permanently?\n\nThis removes the shortlist and all of its AI runs, results and stored pages. This cannot be undone.');">
+      <input type="hidden" name="csrf" value="{{ csrf_token }}">
+      <button type="submit" class="btn danger-btn">Delete shortlist</button>
+    </form>
+    {% endif %}
+  </div>
+
+  {% if saved %}
+  <div class="success" style="margin:0 0 16px;">Saved. Nothing that changes the shortlist was edited,
+    so no new run was needed.</div>
+  {% endif %}
+
+  {% if errors %}
+  <div class="error-summary" role="alert">
+    <h2>There is a problem</h2>
+    <ul>{% for e in errors %}<li>{{ e }}</li>{% endfor %}</ul>
+  </div>
+  {% endif %}
+
+  {% if is_edit %}{{ category_tabs(category, 'filters') }}{% endif %}
+
+  {% if is_edit %}
+  {# Prompt review (AI) — shown once a run has completed. Suggests paste-ready edits to the
+     criteria below (guc-0004c4 has the same review, driven off run-to-run divergence). #}
+  <div class="card" id="card-prompt-improve" hidden style="padding:18px 22px;margin:0 0 20px;">
+    <h3 style="margin:0 0 4px;">Do you want to try to improve your prompt with AI?</h3>
+    <p class="secondary" style="margin:0 0 10px;max-width:760px;">Ask the model to review your runs and propose concrete
+      edits to your include / exclude criteria and KEEP / DROP examples below. <strong>Copy</strong> a suggestion, or
+      <strong>Apply</strong> it straight into its field — then review it and <strong>Save</strong>. Nothing is saved until
+      you do. Uses API credit.</p>
+    <div class="controls" style="align-items:center;gap:12px;flex-wrap:wrap;">
+      <button class="btn" id="pi-btn" type="button">Review the prompts</button>
+      <label class="secondary" style="font-size:14px;">Max words
+        <input id="pi-words" type="number" min="40" max="800" step="10" value="150"
+          style="width:78px;font:inherit;padding:3px 6px;border:2px solid var(--black);border-radius:4px;margin-left:4px;"></label>
+      <span id="pi-status" class="secondary"></span>
+    </div>
+    <div id="pi-out" hidden style="margin-top:14px;">
+      <div style="display:flex;align-items:center;gap:12px;">
+        <span class="secondary" id="pi-meta"></span>
+      </div>
+      <div style="margin:12px 0 4px;padding:16px 18px;border-left:6px solid var(--blue,#1d70b8);
+        background:var(--panel-blue,#e8f1f8);border-radius:0 8px 8px 0;font-size:17px;line-height:1.5;">
+        <strong>ℹ️ Use this as a starting point, not a final answer.</strong> This recommendation may not carry the
+        essence of what you need — review it and use it as inspiration for your next version.</div>
+      <p class="secondary" style="margin:8px 0 0;font-size:12.5px;line-height:1.4;">
+        <strong>Scores</strong> are <em>coverage</em>, not confidence — how much of a page is about the topic:
+        <strong>in passing</strong> (0.01–0.35) · <strong>moderate</strong> (0.36–0.65) · <strong>major</strong> (0.66–1).
+        A page scoring 0 is the wrong sense and is dropped.</p>
+      <div id="pi-text" style="font-size:14px;line-height:1.5;margin:8px 0 0;"></div>
+    </div>
+  </div>
+  <script>
+    (function () {
+      const CID = {{ category.id }};
+      const card = document.getElementById("card-prompt-improve");
+      if (!card) return;
+      const fmtInt = n => Number(n || 0).toLocaleString();
+      let PAIR = null, lastReview = "";
+      // Minimal, XSS-safe markdown → HTML (the model output is our own prompt-controlled markdown).
+      function mdToHtml(md) {
+        const esc = s => String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+        const blocks = [];
+        md = String(md).replace(/```[^\n]*\n?([\s\S]*?)```/g, (m, code) => { blocks.push(code.replace(/\n$/, "")); return `\u0000${blocks.length - 1}\u0000`; });
+        const inline = s => esc(s).replace(/`([^`]+)`/g, "<code>$1</code>")
+          .replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>").replace(/(^|[^*])\*([^*]+)\*/g, "$1<em>$2</em>");
+        // Which editable field a "### <heading>" block targets, so its code block can offer "Apply to field".
+        const FIELD_OF = { "inclusion criteria": "inclusion_context", "exclusion criteria": "exclusion_context",
+          "keep examples": "adjudication_hints_keep", "drop examples": "adjudication_hints_drop" };
+        const lines = md.split(/\r?\n/); let html = "", i = 0, curField = null;
+        const codeStyle = "white-space:pre-wrap;word-break:break-word;background:var(--surface-2);border:1px solid var(--border);border-radius:6px;padding:24px 12px 10px;margin:6px 0;font-size:13px;";
+        const btnStyle = "font:inherit;font-size:12px;padding:2px 8px;border:1px solid var(--border);border-radius:4px;background:var(--white,#fff);cursor:pointer;";
+        while (i < lines.length) {
+          const ln = lines[i], cb = ln.match(/^\u0000(\d+)\u0000$/);
+          if (cb) {
+            const field = curField; curField = null;
+            const apply = field ? `<button type="button" class="md-apply" data-field="${field}" style="${btnStyle}border-color:var(--green,#00703c);color:var(--green,#00703c);font-weight:600;">Apply to field</button>` : "";
+            html += `<div class="md-code" style="position:relative;margin:6px 0;">`
+              + `<div style="position:absolute;top:6px;right:6px;display:flex;gap:6px;">${apply}<button type="button" class="md-copy" style="${btnStyle}">Copy</button></div>`
+              + `<pre style="${codeStyle}">${esc(blocks[+cb[1]])}</pre></div>`;
+            i++; continue;
+          }
+          if (/^\s*---\s*$/.test(ln)) { html += "<hr>"; i++; continue; }
+          const h = ln.match(/^(#{1,6})\s+(.*)$/);
+          if (h) { curField = FIELD_OF[h[2].trim().toLowerCase()] || null; const lvl = Math.min(6, h[1].length + 3); html += `<h${lvl} style="margin:12px 0 4px;">${inline(h[2])}</h${lvl}>`; i++; continue; }
+          if (/^\s*[-*]\s+/.test(ln)) { html += "<ul style='margin:4px 0 4px 18px;'>"; while (i < lines.length && /^\s*[-*]\s+/.test(lines[i])) { html += `<li>${inline(lines[i].replace(/^\s*[-*]\s+/, ""))}</li>`; i++; } html += "</ul>"; continue; }
+          if (/^\s*\d+\.\s+/.test(ln)) { html += "<ol style='margin:4px 0 4px 20px;'>"; while (i < lines.length && /^\s*\d+\.\s+/.test(lines[i])) { html += `<li>${inline(lines[i].replace(/^\s*\d+\.\s+/, ""))}</li>`; i++; } html += "</ol>"; continue; }
+          if (ln.trim() === "") { i++; continue; }
+          const para = [ln]; i++;
+          while (i < lines.length && lines[i].trim() !== "" && !/^\s*[-*]\s+/.test(lines[i]) && !/^(#{1,6})\s/.test(lines[i]) && !/^\u0000\d+\u0000$/.test(lines[i]) && !/^\s*\d+\.\s/.test(lines[i])) { para.push(lines[i]); i++; }
+          html += `<p style="margin:6px 0;">${inline(para.join(" "))}</p>`;
+        }
+        return html;
+      }
+      // Only offer this once a run has completed. Two completed runs → run-to-run divergence review;
+      // one → single-run critique of that run's own borderline keeps / exclusion drops.
+      fetch(`/api/categories/${CID}/runs`).then(r => r.json()).then(j => {
+        const incl = (j.runs || []).filter(r => !r.source_run_id && r.run_status === "complete");
+        incl.sort((a, b) => String(b.started_at || "").localeCompare(String(a.started_at || "")));
+        if (!incl.length) return;   // no completed run yet
+        card.hidden = false;
+        PAIR = { base: incl[0].run_id, comp: (incl[1] && incl[1].run_id) || "" };
+        if (!PAIR.comp) document.getElementById("pi-status").textContent = "One run so far — reviewing it on its own.";
+      }).catch(() => {});
+      document.getElementById("pi-btn").addEventListener("click", async () => {
+        if (!PAIR) return;
+        const btn = document.getElementById("pi-btn"), st = document.getElementById("pi-status");
+        btn.disabled = true; st.textContent = "Reviewing… (uses API credit)";
+        document.getElementById("pi-out").hidden = true;
+        try {
+          const maxWords = parseInt(document.getElementById("pi-words").value, 10) || 150;
+          const jj = await (await fetch(`/api/categories/${CID}/analysis/prompt-review`,
+            { method: "POST", headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ baseline: PAIR.base, comparison: PAIR.comp, max_words: maxWords }) })).json();
+          if (jj.error) { st.textContent = "Error: " + jj.error; return; }
+          st.textContent = "";
+          const n = fmtInt(jj.flips);
+          const label = jj.single ? `${n} borderline page${jj.flips === 1 ? "" : "s"}`
+                                  : `${n} flipping page${jj.flips === 1 ? "" : "s"}`;
+          document.getElementById("pi-meta").textContent =
+            `from ${jj.model || "model"} · reviewed ${label}` + (jj.cost ? ` · $${Number(jj.cost).toFixed(4)}` : "");
+          lastReview = jj.review || "";
+          document.getElementById("pi-text").innerHTML = mdToHtml(lastReview || "_(no reply)_");
+          document.getElementById("pi-out").hidden = false;
+        } catch (e) { st.textContent = "Could not run the review."; }
+        finally { btn.disabled = false; }
+      });
+      // Per-recommendation actions: Copy the block, or Apply it straight into the matching field.
+      document.getElementById("pi-text").addEventListener("click", e => {
+        const copy = e.target.closest(".md-copy");
+        if (copy) {
+          const pre = copy.closest(".md-code").querySelector("pre"); if (!pre) return;
+          navigator.clipboard.writeText(pre.textContent);
+          copy.textContent = "Copied"; setTimeout(() => copy.textContent = "Copy", 1500);
+          return;
+        }
+        const apply = e.target.closest(".md-apply");
+        if (apply) {
+          const field = document.getElementById(apply.dataset.field);
+          const pre = apply.closest(".md-code").querySelector("pre");
+          if (!field || !pre) return;
+          field.value = pre.textContent;
+          field.dispatchEvent(new Event("input", { bubbles: true }));   // fire any field listeners
+          field.scrollIntoView({ behavior: "smooth", block: "center" });
+          const prev = field.style.background;
+          field.style.transition = "background .3s"; field.style.background = "#fff8d6";
+          setTimeout(() => { field.style.background = prev; }, 1400);
+          apply.textContent = "Applied ✓"; setTimeout(() => apply.textContent = "Apply to field", 1600);
+        }
+      });
+    })();
+  </script>
+  {% endif %}
+
+  <form class="tabpanel" method="post" action="{{ action }}">
+      <input type="hidden" name="csrf" value="{{ csrf_token }}">
+    <h2>Filter Parameters</h2>
+
+    <div class="field">
+      <label class="q" for="owner_email">Owner email address</label>
+      <p class="hint">The owner of this shortlist — the person who created it. Not a login.{% if user and not is_edit %}
+        Taken from your account.{% endif %}</p>
+      <input id="owner_email" name="owner_email" type="text"
+        value="{{ v.owner_email or (user.email if user else '') }}"
+        {{ 'readonly style=background:#f3f2f1' if (user and not is_edit) else '' }}>
+    </div>
+
+    <div class="field">
+      <label class="q" for="name">Name</label>
+      <p class="hint">A short, friendly name for this shortlist — any text. Shown in the list and
+        turned into a filename for exports. You can change it any time.</p>
+      <input id="name" name="description" type="text" maxlength="100" placeholder="Farm slurry storage"
+        value="{{ v.description or '' }}">
+      {% if is_edit and v.slug %}<p class="hint">Export filename: <code>{{ v.slug }}</code> (updates when you rename).</p>{% endif %}
+    </div>
+
+    <div class="field">
+      <label class="q" for="org-filter">Organisations <span class="secondary" style="font-weight:400;">(Pre-Inference Filtering: 1)</span></label>
+      <p class="hint">Tick the organisations whose pages to include — the title is shown, the slug is stored.
+        Search to filter the list. Leave none ticked to search all organisations.</p>
+      <details><summary>How this narrows your search</summary>
+        <div class="detail"><p>A page is kept if one of these organisations published it or is named on it.
+          Everything after this point looks only at those pages, so a tighter choice means a faster, cheaper
+          run and fewer irrelevant results.</p></div></details>
+      <div class="sel-box" id="org-selected" aria-live="polite"></div>
+      <input type="search" id="org-filter" class="chk-search" placeholder="Search organisations…" autocomplete="off">
+      {% macro org_node(o, depth) %}
+        <div class="org-node" data-t="{{ (o.title ~ ' ' ~ o.slug)|lower }}" data-depth="{{ depth }}">
+          <div class="org-row" style="padding-left:{{ depth * 18 }}px;">
+            {% if o.children %}<button type="button" class="org-caret" aria-expanded="false"
+              aria-label="Show organisations under {{ o.title }}">▸</button>{% else %}<span class="org-caret-spacer"></span>{% endif %}
+            <label class="chk-item">
+              <input type="checkbox" name="dept_slugs" value="{{ o.slug }}" {{ 'checked' if o.slug in selected_orgs }}>
+              <span>{{ o.title }}{% if o.pages %} <span class="org-count-badge">({{ '{:,}'.format(o.pages) }})</span>{% endif %}</span>
+            </label>
+          </div>
+          {% if o.children %}
+          <div class="org-children" hidden>
+            {% for c in o.children %}{{ org_node(c, depth + 1) }}{% endfor %}
+          </div>
+          {% endif %}
+        </div>
+      {% endmacro %}
+      <div class="checklist" id="org-list">
+        {% for o in org_tree %}{{ org_node(o, 0) }}{% endfor %}
+        {% for s in selected_orgs %}{% if s not in org_option_slugs %}
+        <div class="org-node" data-t="{{ s|lower }}" data-depth="0">
+          <div class="org-row"><span class="org-caret-spacer"></span>
+            <label class="chk-item">
+              <input type="checkbox" name="dept_slugs" value="{{ s }}" checked><span>{{ s }} (not in the org list)</span></label>
+          </div>
+        </div>
+        {% endif %}{% endfor %}
+      </div>
+      <p class="secondary" id="org-count" style="font-size:13px;margin:6px 0 0;"></p>
+      <label class="check" style="margin-top:12px;">
+        <input type="checkbox" name="include_child_orgs" value="1" {{ 'checked' if v.include_child_orgs }}>
+        Include child organisations
+      </label>
+      <p class="hint" style="margin-top:6px;">Also search the pages of any department that sits under
+        an organisation above (e.g. ticking this with <code>department-for-environment-food-rural-affairs</code>
+        also searches Environment Agency, Natural England, Rural Payments Agency, and the rest).</p>
+    </div>
+
+    <div class="field" id="dt-field">
+      <label class="q" for="dt-filter">Page Types <span class="secondary" style="font-weight:400;">(Pre-Inference Filtering: 2)</span></label>
+      <p class="hint">The document types for the organisations above — or across the whole corpus
+        when none are selected — each with its page count (for example <code>Guidance (8,829)</code>),
+        largest first. Tick the ones to include, or tick none to include every type.</p>
+      <details><summary>How this narrows your search</summary>
+        <div class="detail"><p>A page has to match both an organisation (if you set any) and one of these
+          types. The counts come from the corpus for the chosen organisations, or the whole
+          corpus when none are selected.</p></div></details>
+      <div class="sel-box" id="dt-selected" aria-live="polite"></div>
+      <input type="search" id="dt-filter" class="chk-search" placeholder="Search document types…" autocomplete="off">
+      <div class="checklist" id="dt-list">
+        {% for s in selected_doc_types %}
+        <label class="chk-item" data-t="{{ s|lower }}"><input type="checkbox" name="document_type_slugs" value="{{ s }}" checked><span>{{ s|replace('_',' ')|title }}</span></label>
+        {% endfor %}
+      </div>
+      <p class="secondary" id="dt-note" style="font-size:13px;margin:6px 0 0;"></p>
+    </div>
+
+    <div class="field">
+      <label class="q" for="keywords">Inclusion Keyword(s) <span class="secondary" style="font-weight:400;">(Pre-Inference Filtering: 3)</span></label>
+      <p class="hint">One term per line, or separated by commas. A term is a single word, or a phrase whose words sit next to each other.</p>
+      <details><summary>How your terms are matched</summary>
+        <div class="detail">
+          <p>We look through the title and text of every page for the terms you list. A page with none of
+            them is skipped.</p>
+          <p>A single word (<strong>slurry</strong>) matches anywhere. A multi-word term is matched as a
+            <strong>phrase</strong> — the words must appear <em>together, in order</em>
+            (<strong>catch certificate</strong> matches “a catch certificate”, but not a page that merely
+            mentions “catch” and “certificate” far apart). A small linking word between them is allowed
+            (<strong>food standards</strong> still matches “food and standards”). Word endings are matched,
+            so <strong>lagoon</strong> also finds lagoons. Capital letters do not matter.</p>
+          <ul style="margin:0;padding-left:20px;">
+            <li>Avoid broad single words such as farm, water, waste — they match thousands of pages.</li>
+            <li>Prefer a specific word or phrase: slurry, lagoon, catch certificate.</li>
+          </ul>
+        </div></details>
+      <textarea id="keywords" name="keywords" rows="4">{{ v.keywords or '' }}</textarea>
+      <details id="kw-explain-wrap" class="kw-explain-wrap" hidden>
+        <summary>What these keywords will match</summary>
+        <div id="kw-explain" class="kw-explain"></div>
+      </details>
+      <p class="hint" style="margin-top:12px;">After saving, GOV.UK's own Search is also run for these keywords
+        (scoped to the organisations and document types above), pages are tagged by provenance, and any
+        GOV.UK-only pages are fetched into the corpus so the AI Pipeline can evaluate them. This runs
+        automatically on every save — in the background, so it can take a few minutes — and its results appear
+        on the <strong>Hybrid Search</strong> tab.</p>
+    </div>
+
+    <div class="field">
+      <label class="q" for="inclusion_context">What pages do you want to include?</label>
+      <p class="hint" style="margin-bottom:6px;">This is about expressing a goal of what we're looking for.</p>
+      <ul class="hint" style="margin:0 0 10px;padding-left:20px;">
+        <li>Describe your topic in your own words.</li>
+        <li>Be generous about what you expect to review.</li>
+        <li>Try not to exclude too many things.</li>
+      </ul>
+      <details><summary>How to write this well</summary>
+        <div class="detail">
+          <p>Say what the thing is. Do not insist the page is mainly about your topic — a single mention can
+            still be the page you need. Do not list what you are not interested in; that belongs in "What to exclude".</p>
+          <div class="example"><p style="margin:0;">Slurry is liquid or semi-liquid livestock manure: cattle
+            and pig slurry, dirty water, digestate from farm anaerobic digestion, and silage effluent. Include a
+            page if it mentions slurry in this farming sense anywhere, even once.</p></div>
+        </div></details>
+      <textarea id="inclusion_context" name="inclusion_context" rows="4">{{ v.inclusion_context or '' }}</textarea>
+    </div>
+
+    <div class="field">
+      <label class="q" for="exclusion_context">What pages do you want to exclude from here?</label>
+      <p class="hint" style="margin-bottom:6px;">We've filtered the documents and included a set above. From this set are
+        there some types of pages we've picked up that you want to suppress?</p>
+      <ul class="hint" style="margin:0 0 10px;padding-left:20px;">
+        <li>List the things that look relevant but are not.</li>
+        <li>Be as specific as you can.</li>
+      </ul>
+      <details><summary>How to write this well</summary>
+        <div class="detail">
+          <p>Words with another meaning (coal slurry), the wrong subject area (sewage sludge when you mean
+            animal slurry), or pages that mention your topic once in passing. Being concrete works better.</p>
+          <div class="example"><p style="margin:0;">Exclude pages where slurry means something other than
+            livestock manure: coal, mining, concrete slurry. Exclude sewage sludge and biosolids.</p></div>
+        </div></details>
+      <textarea id="exclusion_context" name="exclusion_context" rows="4">{{ v.exclusion_context or '' }}</textarea>
+    </div>
+
+    <div class="field">
+      <h3>Examples of tricky pages <span class="secondary" style="font-weight:400;">(LLM Inference: 3, optional)</span></h3>
+      <p class="hint">One example per line. Skip this unless you already know which pages cause trouble.</p>
+      <label class="secondary" for="adjudication_hints_keep" style="display:block;margin-bottom:5px;">Keep</label>
+      <textarea id="adjudication_hints_keep" name="adjudication_hints_keep" rows="3"
+        placeholder="Grant page that funds slurry stores even if the rest is about payments"
+        style="margin-bottom:20px;">{{ v.adjudication_hints_keep or '' }}</textarea>
+      <label class="secondary" for="adjudication_hints_drop" style="display:block;margin-bottom:5px;">Drop</label>
+      <textarea id="adjudication_hints_drop" name="adjudication_hints_drop" rows="3"
+        placeholder="Sewage sludge or biosolids, not animal slurry">{{ v.adjudication_hints_drop or '' }}</textarea>
+    </div>
+
+    <button class="btn" type="submit">{{ 'Save changes' if is_edit else 'Build shortlist' }}</button>
+  </form>
+
+  <script>
+    // Filter a checkbox list by each item's data-t; used by Organisations and Page Types.
+    function filterChecklist(listEl, query) {
+      var q = (query || "").trim().toLowerCase();
+      [].forEach.call(listEl.querySelectorAll(".chk-item"), function (it) {
+        it.hidden = !!q && (it.dataset.t || it.textContent.toLowerCase()).indexOf(q) === -1;
+      });
+    }
+
+    // Render the ticked items of a checklist as removable tags in a summary box.
+    function renderSelected(listEl, boxEl, emptyText) {
+      if (!listEl || !boxEl) return;
+      var checked = [].slice.call(listEl.querySelectorAll('input:checked'));
+      boxEl.innerHTML = "";
+      if (!checked.length) {
+        var e = document.createElement("span"); e.className = "sel-empty"; e.textContent = emptyText; boxEl.appendChild(e); return;
+      }
+      checked.forEach(function (b) {
+        var span = b.parentNode.querySelector("span");
+        var label = (span ? span.textContent : b.value).replace(/\s*\(\d[\d,]*\)\s*$/, "");   // drop trailing "(345)"
+        var chip = document.createElement("span"); chip.className = "sel-chip";
+        var t = document.createElement("span"); t.textContent = label;
+        var x = document.createElement("button");
+        x.type = "button"; x.className = "sel-x"; x.setAttribute("aria-label", "Remove " + label); x.textContent = "×";
+        x.addEventListener("click", function () { b.checked = false; b.dispatchEvent(new Event("change", { bubbles: true })); });
+        chip.appendChild(t); chip.appendChild(x); boxEl.appendChild(chip);
+      });
+    }
+
+    // Organisations: a hierarchical tree (children tucked under a parent, ordered by page
+    // count). Collapsible branches, a tree-aware search, and a live ticked-count line.
+    (function () {
+      var list = document.getElementById("org-list");
+      if (!list) return;
+      var filter = document.getElementById("org-filter"), count = document.getElementById("org-count");
+      var box = document.getElementById("org-selected");
+
+      function kidsOf(node) { return node.querySelector(":scope > .org-children"); }
+      function caretOf(node) { return node.querySelector(":scope > .org-row > .org-caret"); }
+      function setExpanded(node, open) {
+        var kids = kidsOf(node); if (!kids) return;
+        kids.hidden = !open;
+        var caret = caretOf(node);
+        if (caret) { caret.textContent = open ? "▾" : "▸"; caret.setAttribute("aria-expanded", open ? "true" : "false"); }
+      }
+
+      // Caret click toggles a branch (event delegation; the caret is a real button).
+      list.addEventListener("click", function (e) {
+        var caret = e.target.closest && e.target.closest(".org-caret");
+        if (!caret || !list.contains(caret)) return;
+        var node = caret.closest(".org-node"), kids = kidsOf(node);
+        setExpanded(node, kids && kids.hidden);
+      });
+
+      // Open every ancestor branch that holds a ticked box, so selections are visible.
+      function expandChecked() {
+        [].forEach.call(list.querySelectorAll('input:checked'), function (b) {
+          var node = b.closest(".org-node");
+          var p = node && node.parentNode ? node.parentNode.closest(".org-node") : null;
+          while (p) { setExpanded(p, true); p = p.parentNode ? p.parentNode.closest(".org-node") : null; }
+        });
+      }
+
+      // Search: show a node if it matches or any descendant matches, expanding matches.
+      function search(q) {
+        q = (q || "").trim().toLowerCase();
+        var nodes = [].slice.call(list.querySelectorAll(".org-node"));
+        if (!q) {
+          nodes.forEach(function (n) { n.hidden = false; });
+          [].forEach.call(list.querySelectorAll(".org-children"), function (c) { c.hidden = true; });
+          [].forEach.call(list.querySelectorAll(".org-caret"), function (b) {
+            b.textContent = "▸"; b.setAttribute("aria-expanded", "false"); });
+          expandChecked();
+          return;
+        }
+        nodes.sort(function (a, b) { return (+b.dataset.depth) - (+a.dataset.depth); });  // deepest first
+        var shown = [];
+        function isShown(n) { return shown.indexOf(n) !== -1; }
+        nodes.forEach(function (n) {
+          var self = (n.dataset.t || "").indexOf(q) !== -1;
+          var kidShown = [].some.call(n.querySelectorAll(":scope > .org-children > .org-node"), isShown);
+          if (self || kidShown) shown.push(n);
+        });
+        nodes.forEach(function (n) {
+          n.hidden = !isShown(n);
+          var kids = kidsOf(n); if (kids) kids.hidden = false;   // expand while searching
+          var caret = caretOf(n);
+          if (caret) { caret.textContent = "▾"; caret.setAttribute("aria-expanded", "true"); }
+        });
+      }
+
+      function refreshUI() {
+        var n = list.querySelectorAll('input:checked').length;
+        if (count) count.textContent = n
+          ? (n + " organisation" + (n === 1 ? "" : "s") + " selected")
+          : "None selected — searches all organisations.";
+        renderSelected(list, box, "No organisations selected — searches all organisations.");
+      }
+      if (filter) filter.addEventListener("input", function () { search(filter.value); });
+      list.addEventListener("change", refreshUI);
+      expandChecked();
+      refreshUI();
+    })();
+
+    // Page Types checkbox list: fetch the document types (with counts) the ticked organisations
+    // publish — or corpus-wide when none are ticked — rebuild "Guidance (345)" sorted by
+    // count, preserving ticks; search filters the list.
+    (function () {
+      var orgList = document.getElementById("org-list");
+      var dtList = document.getElementById("dt-list");
+      var dtFilter = document.getElementById("dt-filter");
+      var dtBox = document.getElementById("dt-selected");
+      var childCb = document.querySelector('[name="include_child_orgs"]');
+      var note = document.getElementById("dt-note");
+      var dtField = document.getElementById("dt-field");
+      if (!dtList) return;
+      var DT_EMPTY = "No document types selected — includes every type.";
+      function setLocked(on) {
+        if (dtField) dtField.classList.toggle("dt-disabled", on);
+        if (dtFilter) dtFilter.disabled = on;
+      }
+      function titleCase(s){ return String(s).replace(/_/g, " ").replace(/\b\w/g, function (c) { return c.toUpperCase(); }); }
+      function selectedOrgs(){ return orgList ? [].map.call(orgList.querySelectorAll('input:checked'), function (b) { return b.value; }) : []; }
+      function currentTypes(){ return [].map.call(dtList.querySelectorAll('input:checked'), function (b) { return b.value; }); }
+      function addItem(slug, label, checked) {
+        var lab = document.createElement("label"); lab.className = "chk-item"; lab.dataset.t = (label + " " + slug).toLowerCase();
+        var box = document.createElement("input"); box.type = "checkbox"; box.name = "document_type_slugs"; box.value = slug; box.checked = !!checked;
+        var sp = document.createElement("span"); sp.textContent = label;
+        lab.appendChild(box); lab.appendChild(sp); dtList.appendChild(lab);
+      }
+      var seq = 0;
+      async function refresh() {
+        var keep = currentTypes().filter(Boolean), orgs = selectedOrgs();
+        // No organisation chosen — show corpus-wide counts instead of locking, so a
+        // type-only filter (e.g. all Guidance across GOV.UK) can still be picked.
+        setLocked(false);
+        var params = new URLSearchParams();
+        if (orgs.length) params.set("orgs", orgs.join(","));
+        if (childCb && childCb.checked) params.set("children", "1");
+        var mine = ++seq;
+        if (note) { note.style.color = ""; note.textContent = "Loading document types…"; }
+        try {
+          var res = await fetch("/api/doc-type-counts?" + params.toString());
+          var j = await res.json().catch(function () { return {}; });
+          if (mine !== seq) return;               // a newer request superseded this one
+          if (!res.ok || j.error) throw new Error(j.error || ("HTTP " + res.status));
+          var types = j.types || [], keepSet = {}, present = {};
+          keep.forEach(function (k) { keepSet[k] = true; });
+          dtList.innerHTML = "";
+          types.forEach(function (t) { present[t.type] = true; addItem(t.type, titleCase(t.type) + " (" + Number(t.count).toLocaleString() + ")", keepSet[t.type]); });
+          keep.forEach(function (k) { if (!present[k]) addItem(k, titleCase(k) + " (0)", true); });
+          filterChecklist(dtList, dtFilter ? dtFilter.value : "");
+          renderSelected(dtList, dtBox, DT_EMPTY);
+          if (note) { note.style.color = ""; note.textContent = types.length
+            ? (types.length + " document type" + (types.length === 1 ? "" : "s") + (orgs.length ? " for the selected organisations." : " across the corpus."))
+            : "No document types found."; }
+        } catch (e) {
+          if (note) { note.style.color = "var(--red,#d4351c)";
+            note.textContent = "Error: " + (e && e.message ? e.message : e); }
+        }
+      }
+      if (orgList) orgList.addEventListener("change", refresh);
+      if (childCb) childCb.addEventListener("change", refresh);
+      if (dtFilter) dtFilter.addEventListener("input", function () { filterChecklist(dtList, dtFilter.value); });
+      dtList.addEventListener("change", function () { renderSelected(dtList, dtBox, DT_EMPTY); });
+      renderSelected(dtList, dtBox, DT_EMPTY);   // show the saved selection immediately
+      refresh();
+    })();
+
+    // Live plain-English preview of what the keywords will match after tokenisation.
+    (function () {
+      var ta = document.getElementById("keywords");
+      var wrap = document.getElementById("kw-explain-wrap");
+      var panel = document.getElementById("kw-explain");
+      if (!ta || !wrap || !panel) return;
+      function esc(s){ return String(s == null ? "" : s).replace(/[&<>"]/g, function (c) {
+        return { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]; }); }
+      var timer = null, seq = 0;
+      async function run() {
+        if (!ta.value.trim()) { wrap.hidden = true; panel.innerHTML = ""; return; }
+        var mine = ++seq;
+        try {
+          var r = await fetch("/api/keyword-explain", { method: "POST",
+            headers: { "Content-Type": "application/json" }, body: JSON.stringify({ keywords: ta.value }) });
+          var j = await r.json();
+          if (mine !== seq) return;                       // a newer keystroke won
+          var terms = (j && j.terms) || [];
+          if (!terms.length) { wrap.hidden = true; return; }
+          panel.innerHTML = terms.map(function (t) {
+            return '<div class="kx"><strong>' + esc(t.term) + '</strong>'
+              + '<span class="kx-plain">' + esc(t.plain) + '</span>'
+              + (t.tsquery ? '<span class="kx-q">technical: ' + esc(t.tsquery) + '</span>' : '')
+              + '</div>';
+          }).join("");
+          wrap.hidden = false;
+        } catch (e) { /* leave the last preview in place */ }
+      }
+      ta.addEventListener("input", function () { clearTimeout(timer); timer = setTimeout(run, 400); });
+      if (ta.value.trim()) run();                         // show immediately for an edited shortlist
+    })();
+  </script>
+{% endblock %}
