@@ -232,7 +232,7 @@
     <span class="secondary" style="display:block;margin-top:2px;">Definition, runs, results, membership and
       metadata-only pages — import in a test system to reproduce and fix this shortlist.</span></p>
 
-  <script src="{{ url_for('static', path='ai_pipeline.js') }}"></script>
+  <script src="/static/ai_pipeline.js"></script>
   <script>
     const CID = {{ category.id }};
     const STAGES = [{% for s in stages %}"{{ s.stage }}"{{ "," if not loop.last }}{% endfor %}];

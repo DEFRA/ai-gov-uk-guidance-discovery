@@ -146,6 +146,34 @@ async def _no_cache_html(request: Request, call_next):
     return resp
 
 
+class _ForwardedProtoMiddleware:
+    """Honour X-Forwarded-Proto from the TLS-terminating proxy.
+
+    Azure Container Apps speaks HTTPS to the browser and HTTP to this process, so
+    request.url.scheme would otherwise stay http and url_for() would emit absolute
+    http:// links. The browser then blocks stylesheets and scripts as mixed content.
+    Static assets use root-relative /static/… paths as well; this covers every other
+    generated link, form action, and redirect. Only http/https are accepted.
+    """
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] in ("http", "websocket"):
+            for key, value in scope.get("headers") or ():
+                if key == b"x-forwarded-proto":
+                    proto = value.decode("latin1").split(",")[0].strip().lower()
+                    if proto in ("http", "https"):
+                        scope["scheme"] = proto
+                    break
+        await self.app(scope, receive, send)
+
+
+# Outermost, so scheme is rewritten before any middleware builds a Request.
+app.add_middleware(_ForwardedProtoMiddleware)
+
+
 # ---- last-resort error page ---------------------------------------------
 # Best practice: never surface a traceback, SQL, or stack detail to the user —
 # it leaks internals and is a standard pentest finding. Instead we log the full
