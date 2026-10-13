@@ -78,4 +78,4 @@ Project conventions that must be followed for every change. This file is the hom
 ## Tests
 
 - `python -m unittest discover -s tests` — runs on SQLite; Postgres-only tests skip
-  unless `DB_BACKEND=postgres` and `DB_*` are set. Add tests with new behaviour.
+  unless `DB_BACKEND=postgres` and `DB_*` (or `DATABASE_URL`) are set. Add tests with new behaviour.

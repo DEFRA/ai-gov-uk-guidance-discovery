@@ -9,8 +9,8 @@
 # Or bind-mount a host DB instead of the named volume:
 #   volumes: ["./data:/data"]
 #
-# Postgres: add a postgres service and set DB_HOST=postgres (that flag selects
-# the PG backend). Don't set DB_HOST here or SQLite is skipped.
+# Postgres: add a postgres service and set DB_HOST=postgres or DATABASE_URL
+# (either selects the PG backend). Don't set those here or SQLite is skipped.
 
 services:
   app:

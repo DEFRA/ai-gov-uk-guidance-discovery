@@ -68,6 +68,7 @@ class TestConfigResolution(unittest.TestCase):
         os.close(fd)
         os.environ["CORPUS_DB"] = path
         os.environ.pop("DB_HOST", None)
+        os.environ.pop("DATABASE_URL", None)
         import importlib
         import webapp.app as app
         importlib.reload(app)

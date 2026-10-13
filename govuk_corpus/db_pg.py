@@ -1,7 +1,8 @@
 """Postgres backend — mirrors db.py's API so the stages run unchanged.
 
-Selected by govuk_corpus.backend when DB_HOST (or DB_BACKEND=postgres) is set.
-Connection details come from env: DB_HOST, DB_PORT, DB_NAME, DB_USER, DB_PASSWORD.
+Selected by govuk_corpus.backend when DB_HOST, DATABASE_URL, or
+DB_BACKEND=postgres is set. Connection details come from DATABASE_URL when that
+is set, otherwise DB_HOST, DB_PORT, DB_NAME, DB_USER, DB_PASSWORD.
 Kept intentionally parallel to db.py: same function names/signatures, `%s`
 placeholders, `ON CONFLICT DO NOTHING` in place of SQLite's `INSERT OR IGNORE`.
 """
@@ -16,6 +17,8 @@ from typing import Any, Dict, Optional
 import psycopg
 from psycopg.rows import dict_row
 
+from .db_env import conninfo
+
 _SCHEMA_PATH = os.path.join(os.path.dirname(__file__), "schema_pg.sql")
 GOLD_VOTES_BACKFILL = """INSERT INTO category_gold_votes (category_id, url, labeller, label, rationale, labelled_at, content_id, content_hash_at_label, stratum_score_band, stratum_source, stratum_doc_type, seed_origin, sample_run_id, sample_stage, sample_frac) SELECT category_id, url, COALESCE(labelled_by, 'unknown'), label, rationale, labelled_at, content_id, content_hash_at_label, stratum_score_band, stratum_source, stratum_doc_type, seed_origin, sample_run_id, sample_stage, sample_frac FROM category_gold_labels g WHERE g.label IS NOT NULL AND g.adjudicated_at IS NULL AND NOT EXISTS (SELECT 1 FROM category_gold_votes v WHERE v.category_id = g.category_id AND v.url = g.url)"""
 
@@ -25,13 +28,7 @@ def now_iso() -> str:
 
 
 def _dsn() -> str:
-    return (
-        f"host={os.getenv('DB_HOST', 'localhost')} "
-        f"port={os.getenv('DB_PORT', '5432')} "
-        f"dbname={os.getenv('DB_NAME', 'gov_uk_corpus')} "
-        f"user={os.getenv('DB_USER', 'corpus')} "
-        f"password={os.getenv('DB_PASSWORD', '')}"
-    )
+    return conninfo()
 
 
 def connect(_path: Optional[str] = None, statement_timeout_ms: Optional[int] = None):

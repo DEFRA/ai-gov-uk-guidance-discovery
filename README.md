@@ -70,7 +70,7 @@ narrows the corpus with a deterministic **selection funnel**, then optionally ru
 
 **Backend selection** is by environment (see [backend.py](govuk_corpus/backend.py)):
 
-- Postgres when `DB_BACKEND=postgres` **or** `DB_HOST` is set → `db_pg` (psycopg 3, `%s` placeholders).
+- Postgres when `DB_BACKEND=postgres`, `DB_HOST`, or `DATABASE_URL` is set → `db_pg` (psycopg 3, `%s` placeholders).
 - SQLite otherwise (the default; used by the pilot and the test suite) → `db`.
 
 `psycopg` is only imported when Postgres is selected, so local SQLite runs and the
@@ -112,6 +112,7 @@ loaded by the systemd unit — never commit real secrets):
 | `CORPUS_DB` | SQLite path (local dev) | `data/pilot.db` |
 | `DB_BACKEND` | `postgres` to force the Postgres backend | *(unset → SQLite)* |
 | `DB_HOST` / `DB_PORT` / `DB_NAME` / `DB_USER` / `DB_PASSWORD` | Postgres connection (setting `DB_HOST` also selects Postgres) | — |
+| `DATABASE_URL` | Whole Postgres conninfo (URI or libpq keywords). Selects Postgres and overrides the split `DB_*` vars | *(unset → split vars)* |
 | `DASHBOARD_PASSWORD` | Shared password for the login gate (HMAC `sb_auth` cookie) | — |
 | `ANTHROPIC_API_KEY` / provider keys | LLM evaluation (server only, in the env file) | — |
 | `COUNT_CACHE_TTL` | Funnel/count cache TTL (seconds) | `300` |

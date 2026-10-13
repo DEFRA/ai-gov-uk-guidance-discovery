@@ -98,7 +98,7 @@ flowchart TB
 ```
 
 **Backend-agnostic persistence.** `backend.py` picks the concrete DB module **at import time** —
-`db_pg.py` (PostgreSQL, psycopg 3) when `DB_BACKEND=postgres`/`DB_HOST` is set, otherwise `db.py`
+`db_pg.py` (PostgreSQL, psycopg 3) when `DB_BACKEND=postgres`, `DB_HOST`, or `DATABASE_URL` is set, otherwise `db.py`
 (SQLite). Every module does `from .backend import db` and uses `_P` as the paramstyle placeholder, so
 the same SQL runs on both. Schema lives in `schema.sql` (SQLite) with a Postgres twin `schema_pg.sql`;
 idempotent column migrations run in each backend's `init_db()` on startup.

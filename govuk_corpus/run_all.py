@@ -1,7 +1,8 @@
 """Run the full corpus cycle: Stage 0 -> 1 -> 2 -> 3, each as its own recorded run.
 
-Backend is chosen by env (see govuk_corpus.backend): Postgres when DB_HOST/DB_BACKEND
-is set, else SQLite. This is the single entry point for the daily cron job.
+Backend is chosen by env (see govuk_corpus.backend): Postgres when DB_HOST,
+DATABASE_URL, or DB_BACKEND is set, else SQLite. This is the single entry point
+for the daily cron job.
 
 Examples:
     # server (Postgres via env), full cycle

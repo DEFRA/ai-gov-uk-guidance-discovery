@@ -358,6 +358,7 @@ class TestGoldRoutes(unittest.TestCase):
         os.close(fd)
         os.environ["CORPUS_DB"] = self.path
         os.environ.pop("DB_HOST", None)
+        os.environ.pop("DATABASE_URL", None)
         os.environ["DASHBOARD_PASSWORD"] = ""
         os.environ["AUTH_MODE"] = "shared"
         import importlib

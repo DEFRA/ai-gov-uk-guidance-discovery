@@ -14,7 +14,7 @@ See [README.md](README.md) for what the app does and [database.md](database.md) 
 
 ## A. Local development (SQLite)
 
-The data layer defaults to SQLite whenever `DB_BACKEND` / `DB_HOST` are unset
+The data layer defaults to SQLite whenever `DB_BACKEND` / `DB_HOST` / `DATABASE_URL` are unset
 (see [backend.py](govuk_corpus/backend.py)), so local dev needs nothing but Python.
 
 ### A1. Clone and create a virtualenv
@@ -359,7 +359,8 @@ default is optional; unset means the default. Restart the service after changing
 
 | Var | Default | Purpose |
 |---|---|---|
-| `DB_BACKEND` | _(empty → SQLite)_ | Set to `postgres` to force Postgres. Postgres is also chosen automatically when `DB_HOST` is set. |
+| `DB_BACKEND` | _(empty → SQLite)_ | Set to `postgres` to force Postgres. Postgres is also chosen automatically when `DB_HOST` or `DATABASE_URL` is set. |
+| `DATABASE_URL` | _(unset)_ | Whole Postgres conninfo (`postgresql://user:pass@host:5432/db?sslmode=require`, or libpq keywords). When set, selects Postgres and the split `DB_HOST`/`DB_PORT`/`DB_NAME`/`DB_USER`/`DB_PASSWORD` vars are ignored. |
 | `DB_HOST` | `localhost` (PG) | Postgres host. Setting it selects the Postgres backend. |
 | `DB_PORT` | `5432` | Postgres port. |
 | `DB_NAME` | `gov_uk_corpus` | Postgres database name. |
@@ -422,13 +423,13 @@ managed provider's allow-list) and reload. For a cloud test DB the allow-listed 
 change with your network.
 
 **`psycopg` import error locally**
-You only need psycopg for Postgres. Local dev is SQLite — leave `DB_BACKEND`/`DB_HOST`
-unset. To use Postgres locally, install deps (`pip install -r requirements.txt`) and
-set the `DB_*` vars.
+You only need psycopg for Postgres. Local dev is SQLite — leave `DB_BACKEND`/`DB_HOST`/
+`DATABASE_URL` unset. To use Postgres locally, install deps (`pip install -r requirements.txt`) and
+set the `DB_*` vars or `DATABASE_URL`.
 
 **Wrong backend selected**
-Postgres is chosen when `DB_BACKEND=postgres` **or** `DB_HOST` is set. To force SQLite,
-unset both and set `CORPUS_DB`.
+Postgres is chosen when `DB_BACKEND=postgres`, `DB_HOST`, or `DATABASE_URL` is set. To force SQLite,
+unset all three and set `CORPUS_DB`.
 
 **Semantic/LLM passes do nothing**
 No provider key. Add `ANTHROPIC_API_KEY` (server: the env file). The deterministic

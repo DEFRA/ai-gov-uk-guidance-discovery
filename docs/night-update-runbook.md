@@ -9,7 +9,7 @@ counts, the GOV.UK-coverage augmentation, the AI evaluation — reads from this 
 freshness and completeness of the whole system depends on this one cycle running cleanly.
 
 - **Entry point:** `python3 -m govuk_corpus.run_all` → [`govuk_corpus/run_all.py`](govuk_corpus/run_all.py) (`run_cycle`).
-- **Backend:** chosen by environment ([`govuk_corpus/backend.py`](govuk_corpus/backend.py)) — Postgres when `DB_HOST`/`DB_BACKEND` is set (production), otherwise SQLite (local/dev). On the server, source `/home/ubuntu/gov-uk-corpus.env` first or it silently falls back to a local SQLite dev DB.
+- **Backend:** chosen by environment ([`govuk_corpus/backend.py`](govuk_corpus/backend.py)) — Postgres when `DB_HOST`, `DATABASE_URL`, or `DB_BACKEND` is set (production), otherwise SQLite (local/dev). On the server, source `/home/ubuntu/gov-uk-corpus.env` first or it silently falls back to a local SQLite dev DB.
 - **Scope:** `--scope whole-govuk` (default). The DEFRA work runs against the whole of GOV.UK.
 
 ---

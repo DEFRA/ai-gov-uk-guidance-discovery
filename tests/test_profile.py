@@ -22,6 +22,7 @@ class TestProfile(unittest.TestCase):
         fd, self.path = tempfile.mkstemp(suffix=".db"); os.close(fd)
         os.environ["CORPUS_DB"] = self.path
         os.environ.pop("DB_HOST", None)
+        os.environ.pop("DATABASE_URL", None)
         os.environ.pop("DASHBOARD_PASSWORD", None)   # shared mode, no password -> authed
         import importlib
         import webapp.app as app

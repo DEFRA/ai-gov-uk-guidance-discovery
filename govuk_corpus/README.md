@@ -20,7 +20,7 @@ now and Postgres on migration.
 | `stage_align.py` | **Stage 1** — fetch, hash, upsert with provenance; reads the frontier. |
 | `stage_redirects.py` | **Stage 2** — resolve redirect chains to final (depth-capped, cycle-safe), import destination. |
 | `stage_attachments.py` | **Stage 3** — expand child/attachment pages into the one corpus; record `page_links`. |
-| `backend.py` | Selects the DB backend by env: Postgres (`DB_HOST`/`DB_BACKEND=postgres`) else SQLite. |
+| `backend.py` | Selects the DB backend by env: Postgres (`DB_HOST`/`DATABASE_URL`/`DB_BACKEND=postgres`) else SQLite. |
 | `db_pg.py` | Postgres backend (psycopg3) — mirrors `db.py`'s API so stages run unchanged. |
 | `schema_pg.sql` | Postgres schema (parity with `schema.sql`). |
 | `run_all.py` | Runs the full cycle (Stage 0→1→2→3) — the daily cron entry point. |
@@ -97,7 +97,7 @@ with status / elapsed / success-rate. Same app will host the search/shortlist UI
   keyword, backend-agnostic; keyword is a substring over `content` for now (FTS index
   deferred). This is the corpus's hand-off to inference.
 - **Postgres-ready:** `db_pg.py` + `backend.py` + `schema_pg.sql` run the same stages on
-  Postgres by setting `DB_HOST` (needs `pip install "psycopg[binary]"`). `run_all.py` is the
+  Postgres by setting `DB_HOST` or `DATABASE_URL` (needs `pip install "psycopg[binary]"`). `run_all.py` is the
   daily entry point. Migration: `projects/gov-uk-corpus/lightsail-migration-runbook.md`.
 - **Phase A code complete** (39 tests). **Next (ops):** provision Lightsail + migrate
   (`pgloader`), schedule `run_all` daily. Later: swap the keyword substring for a real index.

@@ -29,7 +29,7 @@ If this document and those files ever disagree, the `.sql` files win.
 environment** and every module imports the active one as `from .backend import db`:
 
 ```python
-if os.getenv("DB_BACKEND") == "postgres" or os.getenv("DB_HOST"):
+if postgres_selected():   # DB_BACKEND=postgres, or DB_HOST, or DATABASE_URL
     from . import db_pg as db     # Postgres
 else:
     from . import db as db        # SQLite (default)
@@ -46,8 +46,9 @@ _P = "%s" if _IS_PG else "?"        # the parameter placeholder
 
 ### Connection
 
-- **Postgres** reads its DSN from env: `DB_HOST`, `DB_PORT` (5432), `DB_NAME`
-  (`gov_uk_corpus`), `DB_USER` (`corpus`), `DB_PASSWORD`. On the server these come from
+- **Postgres** reads its DSN from `DATABASE_URL` when that is set (URI or libpq
+  keyword form, passed through unchanged). Otherwise from `DB_HOST`, `DB_PORT` (5432),
+  `DB_NAME` (`gov_uk_corpus`), `DB_USER` (`corpus`), `DB_PASSWORD`. On the server these come from
   `~/gov-uk-corpus.env` (chmod 600) loaded by the `corpus-shortlist` systemd service.
   Connections use `psycopg.rows.dict_row`, and an optional per-connection
   `statement_timeout` (`DB_STATEMENT_TIMEOUT_MS`) so a slow ad-hoc query can't hang a
