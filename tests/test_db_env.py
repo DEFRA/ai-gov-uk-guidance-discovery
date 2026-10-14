@@ -4,7 +4,7 @@ from __future__ import annotations
 import os
 import unittest
 
-from govuk_corpus.db_env import conninfo, postgres_selected
+from govuk_corpus.db_env import CODE_MARK, conninfo, describe_db_env, postgres_selected
 
 _KEYS = ("DATABASE_URL", "DB_BACKEND", "DB_HOST", "DB_PORT", "DB_NAME", "DB_USER", "DB_PASSWORD")
 
@@ -63,3 +63,41 @@ class TestDbEnv(unittest.TestCase):
 
     def test_sqlite_when_unset(self):
         self.assertFalse(postgres_selected())
+
+    def test_describe_reports_database_url_without_secret(self):
+        url = "postgresql://app:p%40ss@db.example:5432/gov?sslmode=require"
+        os.environ["DATABASE_URL"] = url
+        os.environ["DB_HOST"] = "localhost"
+        os.environ["DB_PASSWORD"] = "s3cret"
+        text = describe_db_env()
+        self.assertIn(f"code={CODE_MARK}", text)
+        self.assertIn("source=DATABASE_URL", text)
+        self.assertIn("DATABASE_URL_key_present=True", text)
+        self.assertIn(f"DATABASE_URL_len={len(url)}", text)
+        self.assertIn("host=db.example", text)
+        self.assertIn("sslmode=require", text)
+        self.assertIn("DB_HOST='localhost'", text)
+        self.assertNotIn("p%40ss", text)
+        self.assertNotIn("p@ss", text)
+        self.assertNotIn("s3cret", text)
+        self.assertNotIn(url, text)
+
+    def test_describe_absent_database_url_uses_split_vars(self):
+        os.environ["DB_BACKEND"] = "postgres"
+        os.environ["DB_HOST"] = "localhost"
+        os.environ["DB_PASSWORD"] = "s3cret"
+        text = describe_db_env()
+        self.assertIn("source=split-vars", text)
+        self.assertIn("DATABASE_URL_key_present=False", text)
+        self.assertIn("DATABASE_URL_len=0", text)
+        self.assertIn("host=localhost", text)
+        self.assertNotIn("s3cret", text)
+
+    def test_describe_blank_database_url_is_present_but_empty(self):
+        os.environ["DATABASE_URL"] = "   "
+        os.environ["DB_HOST"] = "db.internal"
+        text = describe_db_env()
+        self.assertIn("source=split-vars", text)
+        self.assertIn("DATABASE_URL_key_present=True", text)
+        self.assertIn("DATABASE_URL_len=0", text)
+        self.assertIn("host=db.internal", text)

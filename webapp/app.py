@@ -46,6 +46,7 @@ from govuk_corpus import (audit_stats, category_interview, evaluate, evaluate_dr
                           shortlist, stage_align, sustainability, view_counts)
 from govuk_corpus import orgs as orgs_mod   # stable module handle (some routes take an `orgs` param)
 from govuk_corpus.backend import db
+from govuk_corpus.db_env import describe_db_env
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 DB_PATH = os.getenv("CORPUS_DB", "data/pilot.db")
@@ -6031,6 +6032,11 @@ async def save_peak_schedule(request: Request, provider: str):
 
 @app.on_event("startup")
 def _startup():
+    # Before connect(), so a refused localhost socket still leaves proof of which
+    # image this is and whether DATABASE_URL was actually in the environment.
+    # warning: app loggers have no handler of their own, and Python's last-resort
+    # handler only emits WARNING and above — info() would vanish in Container Apps.
+    logging.getLogger("webapp.db").warning("db startup: %s", describe_db_env())
     conn = connect()
     db.init_db(conn)
     conn.close()
