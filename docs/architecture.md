@@ -40,7 +40,7 @@ flowchart LR
   end
   govuk[[GOV.UK sitemap + /api/content]]
   search[[GOV.UK Search API]]
-  llm[[LLM providers<br/>Anthropic · Bedrock · DeepSeek]]
+  llm[[LLM providers<br/>Anthropic · Bedrock · DeepSeek · Foundry]]
 
   user --> web
   admin --> web
@@ -215,9 +215,10 @@ the cross-URL identity used for membership; `page_organisations`/`page_links`/`r
   framework, no CDN scripts.
 - **Data:** PostgreSQL (psycopg 3) in production; SQLite for local/dev and tests. One schema per
   backend, kept in step by `init_db()` migrations.
-- **AI:** the **Anthropic SDK** (`anthropic[bedrock]`) is the single call path for all three providers
-  — Anthropic direct, AWS **Bedrock** (`AnthropicBedrock`), and **DeepSeek** via its
-  Anthropic-compatible endpoint. Default model `claude-haiku-4-5`.
+- **AI:** the **Anthropic SDK** (`anthropic[bedrock]`) calls Anthropic, AWS **Bedrock**
+  (`AnthropicBedrock`), **DeepSeek** (Anthropic-compatible endpoint), and **Azure Foundry Claude**
+  (`AnthropicFoundry`). **Azure Foundry OpenAI** (`gpt-5.4`, `gpt-5.4-mini`) uses the **OpenAI SDK**
+  against the Foundry `/openai/v1/` route. Default model `claude-haiku-4-5`.
 - **Other:** openpyxl (XLSX export), argon2-cffi (Argon2id password hashing), html2text, sqlparse,
   python-dotenv. Corpus ingestion uses **httpx** (see the dependency note in §11).
 

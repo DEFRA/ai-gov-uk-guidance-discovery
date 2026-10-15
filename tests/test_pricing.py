@@ -43,6 +43,12 @@ class TestPricing(unittest.TestCase):
                                      "prompt_cache_miss_tokens": 750})
         self.assertEqual(u, {"in_total": 1050, "hit": 300, "miss": 750, "out": 200})
 
+    def test_usage_breakdown_openai_cached_tokens(self):
+        # Foundry / OpenAI nests the cache read under prompt_tokens_details.
+        u = pricing.usage_breakdown({"prompt_tokens": 2000, "completion_tokens": 100,
+                                     "prompt_tokens_details": {"cached_tokens": 1500}})
+        self.assertEqual(u, {"in_total": 2000, "hit": 1500, "miss": 500, "out": 100})
+
     def test_usage_breakdown_anthropic(self):
         # Anthropic input_tokens excludes cache reads; total = fresh + cache_read.
         class U:  # SDK-like object

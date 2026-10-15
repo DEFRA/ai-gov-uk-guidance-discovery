@@ -147,5 +147,131 @@ class TestFoundryCreds(unittest.TestCase):
         self.assertTrue(llm.provider_configured("foundry"))
 
 
+_OPENAI_ENVS = ("AZURE_OPENAI_API_KEY", "AZURE_OPENAI_BASE_URL", "AZURE_OPENAI_RESOURCE",
+                "FOUNDRY_OPENAI_API_KEY", "FOUNDRY_OPENAI_BASE_URL", "FOUNDRY_OPENAI_RESOURCE",
+                "ANTHROPIC_FOUNDRY_API_KEY", "ANTHROPIC_FOUNDRY_RESOURCE",
+                "ANTHROPIC_FOUNDRY_BASE_URL")
+
+
+class TestFoundryOpenAI(unittest.TestCase):
+    def setUp(self):
+        self._saved = {k: os.environ.get(k) for k in _OPENAI_ENVS}
+        for k in _OPENAI_ENVS:
+            os.environ.pop(k, None)
+
+    def tearDown(self):
+        for k, v in self._saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+    def test_unconfigured_without_endpoint(self):
+        self.assertIsNone(llm.foundry_openai_creds())
+        self.assertFalse(llm.provider_configured("foundry_openai"))
+        os.environ["AZURE_OPENAI_API_KEY"] = "k"
+        self.assertIsNone(llm.foundry_openai_creds())
+
+    def test_explicit_url_and_key(self):
+        os.environ["AZURE_OPENAI_API_KEY"] = "ok"
+        os.environ["AZURE_OPENAI_BASE_URL"] = "https://custom.openai.azure.com/openai/v1/"
+        os.environ["ANTHROPIC_FOUNDRY_RESOURCE"] = "other"
+        creds = llm.foundry_openai_creds()
+        self.assertEqual(creds["api_key"], "ok")
+        self.assertEqual(creds["base_url"], "https://custom.openai.azure.com/openai/v1")
+        self.assertTrue(llm.provider_configured("foundry_openai"))
+
+    def test_reuses_claude_foundry_resource(self):
+        os.environ["ANTHROPIC_FOUNDRY_API_KEY"] = "k"
+        os.environ["ANTHROPIC_FOUNDRY_RESOURCE"] = "res"
+        creds = llm.foundry_openai_creds()
+        self.assertEqual(creds["api_key"], "k")
+        self.assertEqual(creds["base_url"], "https://res.services.ai.azure.com/openai/v1")
+
+    def test_rewrites_claude_base_url(self):
+        os.environ["ANTHROPIC_FOUNDRY_API_KEY"] = "k"
+        os.environ["ANTHROPIC_FOUNDRY_BASE_URL"] = "https://res.services.ai.azure.com/anthropic/"
+        self.assertEqual(llm.foundry_openai_creds()["base_url"],
+                         "https://res.services.ai.azure.com/openai/v1")
+
+    def test_request_is_chat_completions(self):
+        cfg = dict(CFG, provider="foundry_openai", model="gpt-5.4")
+        kw = llm.openai_request_kwargs(cfg, "sys", MSGS, 4096, temperature=0)
+        self.assertEqual(kw["model"], "gpt-5.4")
+        self.assertEqual(kw["max_completion_tokens"], 4096)
+        self.assertNotIn("max_tokens", kw)
+        self.assertEqual(kw["temperature"], 0.0)
+        self.assertEqual(kw["messages"][0], {"role": "system", "content": "sys"})
+        self.assertNotIn("reasoning_effort", kw)
+        kw = llm.openai_request_kwargs(cfg, "", MSGS, 100, effort="low")
+        self.assertEqual(kw["reasoning_effort"], "low")
+        self.assertNotIn("temperature", kw)
+        with self.assertRaises(ValueError):
+            llm.openai_request_kwargs(cfg, "", MSGS, 100, temperature=0, effort="low")
+
+    def test_chat_without_config_is_fatal(self):
+        fo = dict(CFG, provider="foundry_openai", model="gpt-5.4", key=None, base_url="")
+        res = llm.chat(fo, "", MSGS, 10)
+        self.assertTrue(res.get("fatal"))
+
+    def test_chat_prices_cached_prompt_tokens(self):
+        seen = {}
+
+        class _Msg:
+            content = '{"keep": true}'
+            refusal = None
+
+        class _Choice:
+            message = _Msg()
+            finish_reason = "stop"
+
+        class _Completion:
+            model = "gpt-5.4-2026-03-05"
+            choices = [_Choice()]
+            usage = {"prompt_tokens": 1000, "completion_tokens": 20,
+                     "prompt_tokens_details": {"cached_tokens": 800}}
+
+        class _Completions:
+            @staticmethod
+            def create(**kwargs):
+                seen.update(kwargs)
+                return _Completion()
+
+        class _Chat:
+            completions = _Completions()
+
+        class _Client:
+            chat = _Chat()
+
+        orig = llm._openai_client
+        llm._openai_client = lambda config, timeout, max_retries: (_Client(), None)
+        try:
+            cfg = dict(CFG, provider="foundry_openai", model="gpt-5.4", key="k",
+                       base_url="https://res.openai.azure.com/openai/v1",
+                       price_in=2.5, price_out=15.0,
+                       grid={"in_hit_off": 0.25, "in_hit_peak": 0.25,
+                             "in_miss_off": 2.5, "in_miss_peak": 2.5,
+                             "out_off": 15.0, "out_peak": 15.0})
+            res = llm.chat(cfg, "sys", MSGS, 128, temperature=0)
+        finally:
+            llm._openai_client = orig
+        self.assertEqual(res["reply"], '{"keep": true}')
+        self.assertEqual(res["actual_model"], "gpt-5.4-2026-03-05")
+        self.assertEqual(res["stop_reason"], "stop")
+        self.assertEqual((res["input_tokens"], res["cache_hit_tokens"], res["output_tokens"]),
+                         (1000, 800, 20))
+        self.assertAlmostEqual(res["cost_usd"],
+                               (200 / 1e6) * 2.5 + (800 / 1e6) * 0.25 + (20 / 1e6) * 15.0, places=6)
+        self.assertEqual(seen["max_completion_tokens"], 128)
+        self.assertEqual(seen["temperature"], 0.0)
+
+    @unittest.skipUnless(_has_azure_identity(), "no azure-identity")
+    def test_entra_when_keyless_with_endpoint(self):
+        os.environ["AZURE_OPENAI_RESOURCE"] = "res"
+        creds = llm.foundry_openai_creds()
+        self.assertTrue(creds.get("use_entra"))
+        self.assertTrue(llm.provider_configured("foundry_openai"))
+
+
 if __name__ == "__main__":
     unittest.main()

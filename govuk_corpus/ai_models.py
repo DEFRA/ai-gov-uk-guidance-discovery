@@ -38,6 +38,16 @@ _COLS = "id, provider, model_id, input_per_m, output_per_m, " + ", ".join(PRICE_
 # (provider, model_id, input_per_m, output_per_m) seeded when the table is empty.
 # Tiered rates default from these (peak = off-peak, cache-hit = cache-miss); edit
 # per model on the Settings page to enter the supplier's real grid.
+def _flat(hit: float, miss: float, out: float) -> Dict[str, float]:
+    """A price grid with no peak surcharge (peak copies off-peak)."""
+    return {"in_hit_off": hit, "in_hit_peak": hit,
+            "in_miss_off": miss, "in_miss_peak": miss,
+            "out_off": out, "out_peak": out}
+
+
+# (provider, model_id, input_per_m, output_per_m[, prices]). OpenAI rates are the
+# published standard <272k prices (USD / 1M); cache-hit is the cached-input rate.
+# gpt-5.4 above 272k input is a different tariff — eval pages stay well under that.
 _DEFAULTS = [
     ("anthropic", "claude-haiku-4-5-20251001", 1.0, 5.0),
     ("anthropic", "claude-sonnet-5", 2.0, 10.0),
@@ -45,7 +55,13 @@ _DEFAULTS = [
     ("deepseek", "deepseek-chat", 0.27, 1.10),
     ("foundry", "claude-haiku-4-5", 1.0, 5.0),       # Foundry deployment names (no date suffix)
     ("foundry", "claude-sonnet-5", 2.0, 10.0),
+    ("foundry_openai", "gpt-5.4", 2.50, 15.0, _flat(0.25, 2.50, 15.0)),
+    ("foundry_openai", "gpt-5.4-mini", 0.75, 4.50, _flat(0.075, 0.75, 4.50)),
 ]
+
+# Inserted into an existing registry too, so a deploy picks them up. Rows the user
+# already has (same provider + model id) are left alone, prices included.
+_ENSURE = frozenset({"foundry_openai"})
 
 
 def normalise_prices(prices: Optional[Dict], input_per_m: float = 0.0,
@@ -127,8 +143,14 @@ def delete_model(conn, model_id) -> None:
 
 
 def seed_defaults(conn) -> None:
-    """Insert the default models if the table is empty."""
-    if conn.execute("SELECT COUNT(*) AS n FROM ai_models").fetchone()["n"]:
-        return
-    for provider, model_id, i, o in _DEFAULTS:
-        add_model(conn, provider, model_id, i, o)
+    """Insert the default models if the table is empty, and any `_ENSURE` provider's
+    defaults that are still missing (so gpt-5.4 shows up on an existing registry)."""
+    empty = not conn.execute("SELECT COUNT(*) AS n FROM ai_models").fetchone()["n"]
+    for row in _DEFAULTS:
+        provider, model_id, i, o = row[:4]
+        prices = row[4] if len(row) > 4 else None
+        if not empty and provider not in _ENSURE:
+            continue
+        if find(conn, provider, model_id):
+            continue
+        add_model(conn, provider, model_id, i, o, prices=prices)

@@ -65,9 +65,9 @@
             <td><input name="m_{{ m.id }}_model_id" value="{{ m.model_id }}" class="mono"
               style="font-size:13px;padding:3px;border:2px solid var(--black);min-width:200px;"></td>
             {% for f in PF %}
-            <td class="num"><input name="m_{{ m.id }}_{{ f }}" type="number" step="0.01" min="0"
-              value="{{ '%.2f'|format(m[f] or 0) }}"
-              style="width:70px;padding:3px;border:2px solid var(--black);text-align:right;"></td>
+            <td class="num"><input name="m_{{ m.id }}_{{ f }}" type="number" step="0.0001" min="0"
+              value="{{ '%.4f'|format(m[f] or 0) }}"
+              style="width:84px;padding:3px;border:2px solid var(--black);text-align:right;"></td>
             {% endfor %}
             <td>{% if m.has_key %}✅{% else %}<span style="color:#d4351c;">⛔</span>{% endif %}</td>
             <td><button type="button" class="btn secondary-btn test-model" data-id="{{ m.id }}"
@@ -105,7 +105,7 @@
           ('out_off','Output · off-peak'),('out_peak','Output · peak')] %}
         {% for f, lbl in add_labels %}
         <label style="font-size:13px;">{{ lbl }}<br>
-          <input name="add_{{ f }}" type="number" step="0.01" min="0" placeholder="0"
+          <input name="add_{{ f }}" type="number" step="0.0001" min="0" placeholder="0"
             style="width:120px;padding:5px;border:2px solid var(--black);"></label>
         {% endfor %}
         <button class="btn secondary-btn" type="submit">Add model</button>
@@ -125,8 +125,12 @@
 
     <p class="secondary" style="margin-top:25px;max-width:640px;">
       Keys live in <code>~/gov-uk-corpus.env</code> (<code>ANTHROPIC_API_KEY</code>,
-      <code>DEEPSEEK_API_KEY</code>, and <code>ANTHROPIC_WORKSPACE_ID</code> for org-scoped keys); restart the
-      service after changing them. A model whose supplier has no key can be selected but won't run.</p>
+      <code>DEEPSEEK_API_KEY</code>, <code>ANTHROPIC_FOUNDRY_API_KEY</code> for Foundry Claude,
+      <code>AZURE_OPENAI_API_KEY</code> for Foundry OpenAI, and <code>ANTHROPIC_WORKSPACE_ID</code> for
+      org-scoped keys); restart the service after changing them. Foundry OpenAI reuses the Claude
+      Foundry resource when its own endpoint is unset. A model whose supplier has no key can be
+      selected but won't run. Unit prices keep up to 4 decimal places so a sub-cent cache rate
+      (for example $0.075) survives a save.</p>
   </section>
 
   <!-- Tab 2: Execution Guardrails -->

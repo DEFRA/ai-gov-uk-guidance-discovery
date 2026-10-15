@@ -7,6 +7,9 @@ default) nothing is sent and the provider's defaults apply, exactly as before. T
 pins them and stamps them on the run. `supports_sampling` refuses `temperature` on models
 that reject it (Sonnet 5 / Opus 5+ / Fable return HTTP 400), so a pinned run fails fast
 instead of burning a run's worth of 400s.
+
+Azure Foundry is two providers: `foundry` (Claude, Anthropic SDK) and `foundry_openai`
+(OpenAI models such as gpt-5.4, OpenAI SDK against the Foundry `/openai/v1/` route).
 """
 from __future__ import annotations
 
@@ -49,6 +52,14 @@ PROVIDERS = {
                 "model": "claude-haiku-4-5",
                 "key_envs": ("ANTHROPIC_FOUNDRY_API_KEY",),
                 "price_in": 1.0, "price_out": 5.0},
+    # Same Foundry resource, OpenAI v1 route. `model` is the deployment name (it
+    # defaults to the model id, e.g. gpt-5.4). A key/endpoint set for Claude is
+    # reused when the OpenAI-specific vars are absent — see foundry_openai_creds.
+    "foundry_openai": {"label": "Azure Foundry (OpenAI)", "base_url": "",
+                       "model": "gpt-5.4-mini",
+                       "key_envs": ("AZURE_OPENAI_API_KEY", "FOUNDRY_OPENAI_API_KEY",
+                                    "ANTHROPIC_FOUNDRY_API_KEY"),
+                       "price_in": 0.75, "price_out": 4.50},
 }
 DEFAULT_PROVIDER = "anthropic"
 DEFAULT_DAILY_BUDGET = 20.0     # USD/day
@@ -103,6 +114,46 @@ def foundry_creds() -> Optional[dict]:
     return {"use_entra": True, "resource": resource, "base_url": base_url}
 
 
+def foundry_openai_base_url() -> Optional[str]:
+    """Foundry OpenAI v1 endpoint, or None. An explicit URL or resource wins; otherwise
+    the Claude Foundry resource is reused (`…/anthropic` becomes `…/openai/v1`)."""
+    explicit = (os.getenv("AZURE_OPENAI_BASE_URL") or os.getenv("FOUNDRY_OPENAI_BASE_URL") or "").strip().rstrip("/")
+    if explicit:
+        return explicit
+    resource = (os.getenv("AZURE_OPENAI_RESOURCE") or os.getenv("FOUNDRY_OPENAI_RESOURCE") or "").strip()
+    if resource:
+        return f"https://{resource}.services.ai.azure.com/openai/v1"
+    claude = (os.getenv("ANTHROPIC_FOUNDRY_BASE_URL") or "").strip().rstrip("/")
+    if claude:
+        if claude.endswith("/anthropic"):
+            return claude[: -len("/anthropic")] + "/openai/v1"
+        if "/openai/" in claude:
+            return claude
+        return claude + "/openai/v1"
+    resource = (os.getenv("ANTHROPIC_FOUNDRY_RESOURCE") or "").strip()
+    if resource:
+        return f"https://{resource}.services.ai.azure.com/openai/v1"
+    return None
+
+
+def foundry_openai_creds() -> Optional[dict]:
+    """Credentials for Foundry OpenAI, or None if not fully configured. Needs a v1
+    endpoint (see foundry_openai_base_url) plus EITHER an API key (AZURE_OPENAI_API_KEY,
+    or the Claude Foundry key on the same resource) OR Entra ID (azure-identity, no key).
+    The key wins when both are available."""
+    base_url = foundry_openai_base_url()
+    if not base_url:
+        return None
+    key = provider_key("foundry_openai")
+    if key:
+        return {"api_key": key, "base_url": base_url}
+    try:
+        import azure.identity  # noqa: F401
+    except Exception:
+        return None
+    return {"use_entra": True, "base_url": base_url}
+
+
 def provider_configured(provider: str) -> bool:
     """Whether a provider has usable credentials — an API key, AWS creds for Bedrock,
     or a Foundry endpoint plus a key / Entra ID."""
@@ -110,6 +161,8 @@ def provider_configured(provider: str) -> bool:
         return bedrock_creds() is not None
     if provider == "foundry":
         return foundry_creds() is not None
+    if provider == "foundry_openai":
+        return foundry_openai_creds() is not None
     return provider_key(provider) is not None
 
 
@@ -157,6 +210,11 @@ def cfg_for(conn, provider: str, model: str, key: Optional[str] = None) -> dict:
         # needn't re-read env — and so callers can override it per config.
         fc = foundry_creds() or {}
         cfg["resource"] = fc.get("resource")
+        if fc.get("base_url"):
+            cfg["base_url"] = fc["base_url"]
+        cfg["use_entra"] = bool(fc.get("use_entra"))
+    if provider == "foundry_openai":
+        fc = foundry_openai_creds() or {}
         if fc.get("base_url"):
             cfg["base_url"] = fc["base_url"]
         cfg["use_entra"] = bool(fc.get("use_entra"))
@@ -221,8 +279,52 @@ def request_kwargs(config: dict, system: str, messages: list, max_tokens: int, *
     return kwargs
 
 
+def openai_request_kwargs(config: dict, system: str, messages: list, max_tokens: int, *,
+                          temperature: Optional[float] = None,
+                          effort: Optional[str] = None) -> dict:
+    """chat.completions.create(...) kwargs for Foundry OpenAI. `max_tokens` is sent as
+    `max_completion_tokens` (reasoning models reject `max_tokens`). `effort` maps to
+    `reasoning_effort`; omitted means the model's default (none on gpt-5.4). Temperature
+    is only legal while reasoning is off, so a non-none effort plus a temperature fails
+    fast. `thinking` is Claude-only and is not sent."""
+    built = []
+    if (system or "").strip():
+        built.append({"role": "system", "content": system.strip()})
+    built.extend(messages)
+    kwargs: Dict = {"model": config["model"], "max_completion_tokens": max_tokens,
+                    "messages": built}
+    reasoning = effort not in (None, "", "none")
+    if temperature is not None:
+        if not supports_sampling(config["model"]):
+            raise ValueError(f"{config['model']} rejects `temperature` (it thinks adaptively); "
+                             f"run it without sampling controls or pick a model that accepts them")
+        if reasoning:
+            raise ValueError(f"{config['model']} only accepts `temperature` when reasoning effort "
+                             f"is none; drop the temperature or set effort to none")
+        kwargs["temperature"] = float(temperature)
+    if reasoning:
+        kwargs["reasoning_effort"] = effort
+    return kwargs
+
+
+class _RefreshingToken:
+    """Entra bearer that re-reads on each request. The OpenAI SDK interpolates api_key
+    into the Authorization header per call, so __str__ is the refresh hook."""
+
+    def __init__(self, provider):
+        self._provider = provider
+
+    def __str__(self) -> str:
+        return self._provider()
+
+    def __bool__(self) -> bool:
+        return True
+
+
 def _client(config: dict, timeout: float, max_retries: int):
     """The SDK client for a config, or an error dict."""
+    if config.get("provider") == "foundry_openai":
+        return _openai_client(config, timeout, max_retries)
     try:
         import anthropic
     except Exception:
@@ -293,6 +395,99 @@ def _client(config: dict, timeout: float, max_retries: int):
     return anthropic.Anthropic(**client_kwargs), None
 
 
+def _openai_client(config: dict, timeout: float, max_retries: int):
+    """OpenAI SDK client pointed at the Foundry v1 route, or an error dict."""
+    try:
+        from openai import OpenAI
+    except Exception:
+        return None, {"fatal": True,
+                      "error": "The 'openai' package is not installed. Run: pip install -r requirements.txt"}
+    creds = foundry_openai_creds() or {}
+    base_url = config.get("base_url") or creds.get("base_url")
+    api_key = config.get("key") or creds.get("api_key")
+    use_entra = config.get("use_entra") or creds.get("use_entra")
+    if not base_url or (not api_key and not use_entra):
+        return None, {"fatal": True, "error": "Azure Foundry OpenAI not configured. Set "
+                      "AZURE_OPENAI_BASE_URL (or AZURE_OPENAI_RESOURCE) plus AZURE_OPENAI_API_KEY "
+                      "in ~/gov-uk-corpus.env and restart — or leave the key unset with azure-identity "
+                      "installed for Entra ID. A Foundry resource already set for Claude "
+                      "(ANTHROPIC_FOUNDRY_RESOURCE / ANTHROPIC_FOUNDRY_API_KEY) is reused when the "
+                      "OpenAI vars are absent."}
+    okw = dict(base_url=base_url, timeout=timeout, max_retries=max_retries)
+    if api_key:
+        okw["api_key"] = api_key
+    else:
+        try:
+            from azure.identity import DefaultAzureCredential, get_bearer_token_provider
+        except Exception:
+            return None, {"fatal": True, "error": "Entra ID needs the 'azure-identity' package. "
+                          "Run: pip install azure-identity (or set AZURE_OPENAI_API_KEY)."}
+        okw["api_key"] = _RefreshingToken(get_bearer_token_provider(
+            DefaultAzureCredential(), "https://cognitiveservices.azure.com/.default"))
+    return OpenAI(**okw), None
+
+
+def _openai_text(msg) -> tuple:
+    """(reply text, finish_reason) from a chat.completions payload."""
+    choices = getattr(msg, "choices", None) or (msg.get("choices") if isinstance(msg, dict) else None) or []
+    if not choices:
+        return "", None
+    choice = choices[0]
+    message = getattr(choice, "message", None)
+    if message is None and isinstance(choice, dict):
+        message = choice.get("message")
+    content = getattr(message, "content", None) if message is not None and not isinstance(message, dict) else (
+        message.get("content") if isinstance(message, dict) else None)
+    if isinstance(content, str):
+        text = content
+    elif isinstance(content, list):
+        parts = []
+        for p in content:
+            if isinstance(p, str):
+                parts.append(p)
+            elif isinstance(p, dict):
+                parts.append(p.get("text") or "")
+            else:
+                parts.append(getattr(p, "text", "") or "")
+        text = "".join(parts)
+    else:
+        text = ""
+    if not text and message is not None:
+        text = (getattr(message, "refusal", None) if not isinstance(message, dict)
+                else message.get("refusal")) or ""
+    stop = getattr(choice, "finish_reason", None) if not isinstance(choice, dict) else choice.get("finish_reason")
+    return text, stop
+
+
+def _priced(config: dict, text: str, actual_model, usage, stop_reason) -> dict:
+    """The chat() success payload: tokens and cost from a normalised usage breakdown."""
+    u = pricing.usage_breakdown(usage)   # {in_total, hit, miss, out} across providers
+    peak = pricing.is_peak_now(config.get("peak_bitmap"))
+    in_tok = u["in_total"] if u else None
+    out_tok = u["out"] if u else None
+    cache_hit = u["hit"] if u else 0
+    cache_miss = u["miss"] if u else 0
+    cost = None
+    if u is not None:
+        grid = config.get("grid")
+        if grid:   # tiered price grid × peak schedule: miss tokens at miss rate, hit at hit rate
+            cost = pricing.call_cost(grid, peak, u["miss"], u["out"], u["hit"])
+        if cost is None:   # fall back to the flat standard rate on the total input
+            cost = round((in_tok / 1e6) * config["price_in"]
+                         + (out_tok / 1e6) * config["price_out"], 6)
+    return {"reply": text, "model": config["model"], "actual_model": actual_model,
+            "provider": config["provider"], "peak": peak, "stop_reason": stop_reason,
+            "cache_hit_tokens": cache_hit, "cache_miss_tokens": cache_miss,
+            "input_tokens": in_tok, "output_tokens": out_tok, "cost_usd": cost,
+            "price_input_per_m": config["price_in"], "price_output_per_m": config["price_out"]}
+
+
+def _call_failed(config: dict, e: Exception) -> dict:
+    logging.getLogger("assistant").exception("AI call failed (provider=%s model=%s)",
+                                             config.get("provider"), config.get("model"))
+    return {"error": f"{type(e).__name__}: {e}"}
+
+
 def chat(config: dict, system: str, messages: list, max_tokens: int = 1024,
          cache_system: bool = False, *, temperature: Optional[float] = None,
          thinking: Optional[dict] = None, effort: Optional[str] = None) -> dict:
@@ -303,44 +498,38 @@ def chat(config: dict, system: str, messages: list, max_tokens: int = 1024,
     # evaluation run. Tune with AI_MAX_RETRIES / AI_TIMEOUT.
     timeout = float(os.getenv("AI_TIMEOUT", "45"))
     max_retries = int(os.getenv("AI_MAX_RETRIES", "4"))
-    client, err = _client(config, timeout, max_retries)
-    if err:
-        return err
+    # Validate the request before building a client, so a refused temperature is fatal
+    # even when the SDK or credentials are missing.
+    if config.get("provider") == "foundry_openai":
+        try:
+            kwargs = openai_request_kwargs(config, system, messages, max_tokens,
+                                           temperature=temperature, effort=effort)
+        except ValueError as e:
+            return {"fatal": True, "error": str(e)}
+        client, err = _client(config, timeout, max_retries)
+        if err:
+            return err
+        try:
+            msg = client.chat.completions.create(**kwargs)
+            text, stop = _openai_text(msg)
+            return _priced(config, text, getattr(msg, "model", None), getattr(msg, "usage", None), stop)
+        except Exception as e:
+            return _call_failed(config, e)
     try:
         kwargs = request_kwargs(config, system, messages, max_tokens, cache_system=cache_system,
                                 temperature=temperature, thinking=thinking, effort=effort)
     except ValueError as e:
         return {"fatal": True, "error": str(e)}
+    client, err = _client(config, timeout, max_retries)
+    if err:
+        return err
     try:
         msg = client.messages.create(**kwargs)
         text = "".join(getattr(b, "text", "") for b in msg.content)
-        actual_model = getattr(msg, "model", None)   # what the API actually served
-        usage = getattr(msg, "usage", None)
-        u = pricing.usage_breakdown(usage)   # {in_total, hit, miss, out} across providers
-        # Peak or off-peak for this supplier at the moment the call ran (UTC).
-        peak = pricing.is_peak_now(config.get("peak_bitmap"))
-        in_tok = u["in_total"] if u else None
-        out_tok = u["out"] if u else None
-        cache_hit = u["hit"] if u else 0
-        cache_miss = u["miss"] if u else 0
-        cost = None
-        if u is not None:
-            grid = config.get("grid")
-            if grid:   # tiered price grid × peak schedule: miss tokens at miss rate, hit at hit rate
-                cost = pricing.call_cost(grid, peak, u["miss"], u["out"], u["hit"])
-            if cost is None:   # fall back to the flat standard rate on the total input
-                cost = round((in_tok / 1e6) * config["price_in"]
-                             + (out_tok / 1e6) * config["price_out"], 6)
-        return {"reply": text, "model": config["model"], "actual_model": actual_model,
-                "provider": config["provider"], "peak": peak,
-                "stop_reason": getattr(msg, "stop_reason", None),
-                "cache_hit_tokens": cache_hit, "cache_miss_tokens": cache_miss,
-                "input_tokens": in_tok, "output_tokens": out_tok, "cost_usd": cost,
-                "price_input_per_m": config["price_in"], "price_output_per_m": config["price_out"]}
+        return _priced(config, text, getattr(msg, "model", None), getattr(msg, "usage", None),
+                       getattr(msg, "stop_reason", None))
     except Exception as e:  # network / auth / API errors surfaced to the caller
-        logging.getLogger("assistant").exception("AI call failed (provider=%s model=%s)",
-                                                 config.get("provider"), config.get("model"))
-        return {"error": f"{type(e).__name__}: {e}"}
+        return _call_failed(config, e)
 
 
 def reply(config: dict, system: str, prompt: str, *, sampling: Optional[dict] = None) -> dict:

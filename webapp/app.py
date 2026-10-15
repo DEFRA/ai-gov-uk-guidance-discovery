@@ -405,6 +405,7 @@ DEFAULT_PROVIDER = llm.DEFAULT_PROVIDER
 _provider_key = llm.provider_key
 _bedrock_creds = llm.bedrock_creds
 _foundry_creds = llm.foundry_creds
+_foundry_openai_creds = llm.foundry_openai_creds
 
 
 def _provider_configured(provider: str) -> bool:
@@ -414,6 +415,8 @@ def _provider_configured(provider: str) -> bool:
         return _bedrock_creds() is not None
     if provider == "foundry":
         return _foundry_creds() is not None
+    if provider == "foundry_openai":
+        return _foundry_openai_creds() is not None
     return _provider_key(provider) is not None
 
 
@@ -454,6 +457,11 @@ def _config_from_model(conn, m: dict) -> dict:
     if provider == "foundry":
         fc = _foundry_creds() or {}
         cfg["resource"] = fc.get("resource")
+        if fc.get("base_url"):
+            cfg["base_url"] = fc["base_url"]
+        cfg["use_entra"] = bool(fc.get("use_entra"))
+    if provider == "foundry_openai":
+        fc = _foundry_openai_creds() or {}
         if fc.get("base_url"):
             cfg["base_url"] = fc["base_url"]
         cfg["use_entra"] = bool(fc.get("use_entra"))
@@ -5982,7 +5990,8 @@ async def test_model_route(request: Request, mid: int):
     cfg = _cfg_for(conn, row["provider"], row["model_id"])
     conn.close()
     if not _provider_configured(row["provider"]):   # API key, AWS creds, or Foundry endpoint
-        creds = {"bedrock": "AWS credentials", "foundry": "Foundry endpoint + key"}.get(
+        creds = {"bedrock": "AWS credentials", "foundry": "Foundry endpoint + key",
+                 "foundry_openai": "Foundry OpenAI endpoint + key"}.get(
             row["provider"], "API key")
         return JSONResponse({"ok": False,
                              "error": f"No {creds} set for {cfg['label']}."})

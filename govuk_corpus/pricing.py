@@ -55,6 +55,8 @@ def usage_breakdown(usage) -> Optional[dict]:
     Handles both shapes:
       * DeepSeek (OpenAI-style): prompt_tokens, completion_tokens,
         prompt_cache_hit_tokens, prompt_cache_miss_tokens.
+      * OpenAI / Foundry: prompt_tokens, completion_tokens, and cached input under
+        prompt_tokens_details.cached_tokens.
       * Anthropic: input_tokens (fresh, excludes cache reads), output_tokens,
         cache_read_input_tokens (hit), cache_creation_input_tokens (billed as miss).
     """
@@ -62,6 +64,10 @@ def usage_breakdown(usage) -> Optional[dict]:
         return None
     out = _field(usage, "output_tokens", "completion_tokens")
     hit = _field(usage, "prompt_cache_hit_tokens", "cache_read_input_tokens")
+    if not hit:
+        details = _field(usage, "prompt_tokens_details")
+        if details is not None:
+            hit = _field(details, "cached_tokens")
     miss = _field(usage, "prompt_cache_miss_tokens")
     fresh = _field(usage, "input_tokens")                       # Anthropic: excludes cache reads
     creation = _field(usage, "cache_creation_input_tokens")

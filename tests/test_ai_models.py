@@ -59,6 +59,27 @@ class TestAiModels(unittest.TestCase):
         self.assertEqual((row["in_miss_off"], row["in_miss_peak"]), (5.0, 5.0))
         self.assertEqual((row["out_off"], row["out_peak"]), (25.0, 25.0))
 
+    def test_seed_configures_foundry_openai_models(self):
+        ai_models.seed_defaults(self.conn)
+        full = ai_models.find(self.conn, "foundry_openai", "gpt-5.4")
+        mini = ai_models.find(self.conn, "foundry_openai", "gpt-5.4-mini")
+        self.assertEqual((full["input_per_m"], full["output_per_m"], full["in_hit_off"]),
+                         (2.5, 15.0, 0.25))
+        self.assertEqual((mini["input_per_m"], mini["output_per_m"], mini["in_hit_off"]),
+                         (0.75, 4.5, 0.075))
+
+    def test_foundry_openai_added_to_existing_registry(self):
+        ai_models.add_model(self.conn, "anthropic", "claude-haiku-4-5-20251001", 1.0, 5.0)
+        ai_models.seed_defaults(self.conn)
+        self.assertIsNotNone(ai_models.find(self.conn, "foundry_openai", "gpt-5.4"))
+        self.assertIsNotNone(ai_models.find(self.conn, "foundry_openai", "gpt-5.4-mini"))
+        # A model the user already priced is not reset, and the pair is not duplicated.
+        ai_models.seed_defaults(self.conn)
+        n = self.conn.execute(
+            "SELECT COUNT(*) AS n FROM ai_models WHERE provider = 'foundry_openai'").fetchone()["n"]
+        self.assertEqual(n, 2)
+        self.assertIsNone(ai_models.find(self.conn, "anthropic", "claude-sonnet-5"))
+
 
 @unittest.skipUnless(__import__("importlib").util.find_spec("fastapi"), "no fastapi")
 class TestConfigResolution(unittest.TestCase):

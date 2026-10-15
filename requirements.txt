@@ -17,4 +17,5 @@ jinja2==3.1.4
 python-multipart==0.0.9
 argon2-cffi>=23,<25          # Argon2id password hashing (user accounts / auth)
 anthropic[bedrock]>=0.74,<1.0   # >=0.74 for the AnthropicFoundry client
+openai>=1.40,<3                # Foundry OpenAI (gpt-5.4) via the /openai/v1/ route
 openpyxl==3.1.5

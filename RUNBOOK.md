@@ -143,6 +143,9 @@ ANTHROPIC_API_KEY=sk-ant-...
 # Azure Foundry (Claude) instead of / alongside Anthropic direct:
 # ANTHROPIC_FOUNDRY_RESOURCE=<foundry-resource-name>
 # ANTHROPIC_FOUNDRY_API_KEY=<foundry-api-key>
+# Foundry OpenAI (gpt-5.4, gpt-5.4-mini) reuses that resource and key. To point it
+# elsewhere, set AZURE_OPENAI_API_KEY plus AZURE_OPENAI_BASE_URL (…/openai/v1) or
+# AZURE_OPENAI_RESOURCE.
 ```
 
 Lock it down:
